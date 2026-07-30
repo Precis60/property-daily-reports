@@ -329,6 +329,25 @@ async function acknowledgeAssignedTaskInSupabase(id, name) {
   await supabaseFetch(`/assigned_tasks?id=eq.${id}`, { method: "PATCH", body: { acknowledged_by: next } });
 }
 
+function monthGridDays(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  const first = new Date(y, m - 1, 1);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const lead = (first.getDay() === 0 ? 6 : first.getDay() - 1); // Monday-first
+  const cells = Array(lead).fill(null);
+  for (let d = 1; d <= daysInMonth; d += 1) {
+    cells.push(`${ym}-${String(d).padStart(2, "0")}`);
+  }
+  while (cells.length % 7 !== 0) cells.push(null);
+  return cells;
+}
+
+function fmtShortDay(iso) {
+  const d = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-AU", { day: "numeric", month: "short" });
+}
+
 function fmtDayHeading(iso) {
   const d = new Date(`${iso}T00:00:00`);
   if (Number.isNaN(d.getTime())) return iso;
@@ -1171,6 +1190,8 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
   const [error, setError] = useState("");
   const [added, setAdded] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [calMonth, setCalMonth] = useState(monthOf(todayISO()));
+  const [selectedDay, setSelectedDay] = useState(todayISO());
 
   function toggleAnyone() {
     setIsAnyone((prev) => {
@@ -1207,11 +1228,19 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
   }
 
   const upcoming = [...assignedTasks].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-  const byDate = [];
+  const tasksByDate = new Map();
   upcoming.forEach((t) => {
-    const group = byDate.find((g) => g.date === t.date);
+    if (!tasksByDate.has(t.date)) tasksByDate.set(t.date, []);
+    tasksByDate.get(t.date).push(t);
+  });
+
+  const thisWeekStart = startOfWeek(todayISO());
+  const thisWeekEnd = addDays(thisWeekStart, 6);
+  const weekGroups = [];
+  upcoming.filter((t) => t.date >= thisWeekStart && t.date <= thisWeekEnd).forEach((t) => {
+    const group = weekGroups.find((g) => g.date === t.date);
     if (group) group.tasks.push(t);
-    else byDate.push({ date: t.date, tasks: [t] });
+    else weekGroups.push({ date: t.date, tasks: [t] });
   });
 
   return (
@@ -1256,11 +1285,55 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
       </div>
 
       <div className="lp-panel">
-        <h4><ClipboardList size={15} /> Assigned tasks ({upcoming.length})</h4>
-        {upcoming.length === 0 ? (
-          <EmptyState compact icon={<Check size={16} />} text="No tasks assigned yet." />
+        <div className="lp-cal-head">
+          <button type="button" className="lp-btn-ghost" aria-label="Previous month" onClick={() => setCalMonth((m) => addMonths(m, -1))}><ChevronLeft size={15} /></button>
+          <h4>{fmtMonthLong(calMonth)}</h4>
+          <button type="button" className="lp-btn-ghost" aria-label="Next month" onClick={() => setCalMonth((m) => addMonths(m, 1))}><ChevronRight size={15} /></button>
+          <button type="button" className="lp-btn-ghost" onClick={() => { setCalMonth(monthOf(todayISO())); setSelectedDay(todayISO()); }}>Today</button>
+        </div>
+        <div className="lp-cal-weekdays">
+          {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => <span key={d}>{d}</span>)}
+        </div>
+        <div className="lp-cal-grid">
+          {monthGridDays(calMonth).map((iso, i) => {
+            if (!iso) return <span className="lp-cal-cell is-empty" key={`e${i}`} />;
+            const count = tasksByDate.get(iso)?.length || 0;
+            const classes = [
+              "lp-cal-cell",
+              count > 0 ? "has-tasks" : "",
+              iso === selectedDay ? "is-selected" : "",
+              iso === todayISO() ? "is-today" : "",
+            ].join(" ");
+            return (
+              <button type="button" className={classes} key={iso} onClick={() => setSelectedDay(iso)}>
+                <span className="lp-cal-day">{Number(iso.slice(8, 10))}</span>
+                {count > 0 && <span className="lp-cal-count">{count}</span>}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="lp-cal-selected">
+          <div className="lp-assigned-day-head">
+            <span className="lp-assigned-day-date"><CalendarDays size={13} /> {fmtDayHeading(selectedDay)}</span>
+            <span className="lp-hint">{(tasksByDate.get(selectedDay) || []).length} task(s)</span>
+          </div>
+          {(tasksByDate.get(selectedDay) || []).length === 0 ? (
+            <EmptyState compact icon={<Check size={16} />} text="Nothing assigned for this day." />
+          ) : (
+            <ul className="lp-assigned-list">
+              {tasksByDate.get(selectedDay).map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} onUpdate={onUpdate} />)}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      <div className="lp-panel">
+        <h4><ClipboardList size={15} /> This week ({fmtShortDay(thisWeekStart)} – {fmtShortDay(addDays(thisWeekStart, 6))})</h4>
+        {weekGroups.length === 0 ? (
+          <EmptyState compact icon={<Check size={16} />} text="No tasks assigned this week." />
         ) : (
-          byDate.map((group) => {
+          weekGroups.map((group) => {
             const acked = group.tasks.filter((t) => (t.acknowledgedBy || []).length > 0).length;
             return (
               <div className="lp-assigned-day" key={group.date}>
@@ -1275,6 +1348,7 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
             );
           })
         )}
+        <p className="lp-hint">{upcoming.length} task(s) assigned in total — use the calendar above to see any other day.</p>
       </div>
     </div>
   );
@@ -1728,6 +1802,18 @@ body{margin:0;}
 .lp-assigned-actions{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap;justify-content:flex-end;}
 .lp-ack-chip{font-size:12px;padding:5px 9px;}
 .lp-ack-chip.is-acked{border-color:var(--green);color:var(--green);}
+.lp-cal-head{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+.lp-cal-head h4{flex:1;margin:0;}
+.lp-cal-weekdays{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-soft);text-align:center;margin-bottom:4px;}
+.lp-cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;}
+.lp-cal-cell{position:relative;aspect-ratio:1;border:1px solid var(--line);border-radius:9px;background:#fff;font:inherit;font-size:13px;color:var(--ink);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;}
+.lp-cal-cell.is-empty{border:none;background:none;cursor:default;}
+.lp-cal-cell.has-tasks{background:#FBF4E8;border-color:var(--brass);font-weight:700;}
+.lp-cal-cell.is-today{box-shadow:inset 0 0 0 2px var(--brass);}
+.lp-cal-cell.is-selected{background:var(--green);border-color:var(--green);color:#fff;}
+.lp-cal-count{position:absolute;top:2px;right:3px;font-size:9px;font-weight:700;background:var(--green);color:#fff;border-radius:999px;min-width:13px;height:13px;line-height:13px;text-align:center;padding:0 3px;}
+.lp-cal-cell.is-selected .lp-cal-count{background:#fff;color:var(--green);}
+.lp-cal-selected{margin-top:14px;padding-top:12px;border-top:1px solid var(--line);}
 .lp-assigned-edit-actions{display:flex;gap:8px;flex-wrap:wrap;}
 .lp-assigned-day{border:1px solid var(--line);border-radius:11px;padding:10px 12px;margin-bottom:12px;}
 .lp-assigned-day-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-bottom:8px;border-bottom:1px dashed var(--line);margin-bottom:6px;}
