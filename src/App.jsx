@@ -277,14 +277,29 @@ async function loadAssignedTasks() {
     const rows = await supabaseFetch("/assigned_tasks?active=eq.true&select=*");
     return (rows || []).map((row) => ({
       id: row.id, date: row.date, text: row.task_text, assignedTo: row.assigned_to || [], createdAt: row.created_at,
+      startTime: row.start_time || "", endTime: row.end_time || "",
     }));
   } catch { return []; }
 }
 async function createAssignedTaskInSupabase(task) {
-  await supabaseFetch("/assigned_tasks", {
-    method: "POST",
-    body: [{ id: task.id, date: task.date, task_text: task.text, assigned_to: task.assignedTo, created_at: task.createdAt, active: true }],
-  });
+  const base = { id: task.id, date: task.date, task_text: task.text, assigned_to: task.assignedTo, created_at: task.createdAt, active: true };
+  try {
+    await supabaseFetch("/assigned_tasks", {
+      method: "POST",
+      body: [{ ...base, start_time: task.startTime || null, end_time: task.endTime || null }],
+    });
+  } catch (e) {
+    if (!/start_time|end_time/i.test(e.message)) throw e;
+    if (task.startTime || task.endTime) {
+      throw new Error("Expected times need a one-off database update — run supabase/schema.sql in Supabase, or leave the times blank.");
+    }
+    await supabaseFetch("/assigned_tasks", { method: "POST", body: [base] });
+  }
+}
+
+function expectedWindowLabel(task) {
+  if (!task.startTime || !task.endTime) return "";
+  return `${fmtTime12(task.startTime)}\u2013${fmtTime12(task.endTime)}`;
 }
 async function deleteReportInSupabase(id) {
   await supabaseFetch(`/reports?id=eq.${id}`, { method: "DELETE" });
@@ -538,7 +553,10 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks }) {
     if (addedAssignedIds.includes(task.id) || tasks.length >= MAX_TASKS) return;
     setTasks((prev) => {
       const base = prev.length === 1 && !prev[0].area && !prev[0].workType && !prev[0].description ? prev.slice(1) : prev;
-      return [...base, { ...emptyTask(), description: task.text, fromAssignedId: task.id }];
+      const expectedMinutes = task.startTime && task.endTime
+        ? String(Math.round(hoursBetween(task.startTime, task.endTime) * 60))
+        : "";
+      return [...base, { ...emptyTask(), description: task.text, minutes: expectedMinutes, fromAssignedId: task.id }];
     });
     setAddedAssignedIds((prev) => [...prev, task.id]);
     setTaskCountChoice("5+");
@@ -650,7 +668,10 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks }) {
                   const already = addedAssignedIds.includes(t.id);
                   return (
                     <li key={t.id}>
-                      <span>{t.text}</span>
+                      <span>
+                        {t.text}
+                        {expectedWindowLabel(t) && <em className="lp-assigned-window"> — expected {expectedWindowLabel(t)} ({fmtHours(hoursBetween(t.startTime, t.endTime))})</em>}
+                      </span>
                       <button type="button" className="lp-btn-ghost lp-assigned-add" disabled={already} onClick={() => pullInAssignedTask(t)}>
                         {already ? <><Check size={13} /> Added</> : <><Plus size={13} /> Add to my tasks</>}
                       </button>
@@ -939,6 +960,9 @@ function AssignedTaskRow({ task, onRemove }) {
       <div className="lp-assigned-meta">
         <span className="lp-tag">{task.date}</span>
         <span className="lp-tag">{assignedToLabel(task.assignedTo)}</span>
+        {expectedWindowLabel(task) && (
+          <span className="lp-tag"><Clock size={11} /> {expectedWindowLabel(task)} ({fmtHours(hoursBetween(task.startTime, task.endTime))})</span>
+        )}
       </div>
       <p>{task.text}</p>
       <button type="button" className="lp-btn-ghost lp-btn-danger" onClick={handleRemove} disabled={removing}>
@@ -955,6 +979,8 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
   const [isAnyone, setIsAnyone] = useState(true);
   const [selectedNames, setSelectedNames] = useState([]);
   const [text, setText] = useState("");
+  const [startTime, setStartTime] = useState("");
+  const [endTime, setEndTime] = useState("");
   const [error, setError] = useState("");
   const [added, setAdded] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -974,12 +1000,14 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
   async function handleAdd() {
     if (!text.trim()) { setError("Describe the task before adding it."); return; }
     if (!isAnyone && selectedNames.length === 0) { setError("Tick who this task is for, or choose Anyone."); return; }
+    if (Boolean(startTime) !== Boolean(endTime)) { setError("Enter both a start and a finish time, or leave both blank."); return; }
+    if (startTime && endTime && hoursBetween(startTime, endTime) === 0) { setError("Finish time must be different to the start time."); return; }
     setError("");
     setAdding(true);
     try {
       await onAdd({
         id: uid(), date, assignedTo: isAnyone ? [] : selectedNames,
-        text: text.trim(), createdAt: new Date().toISOString(),
+        text: text.trim(), startTime, endTime, createdAt: new Date().toISOString(),
       });
       setText("");
       setAdded(true);
@@ -1018,6 +1046,17 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
         <Field label="What needs doing">
           <textarea className="lp-textarea" rows={2} value={text} onChange={(e) => setText(e.target.value)} placeholder="e.g. Fix the irrigation leak near the north boundary" />
         </Field>
+        <div className="lp-row2">
+          <Field label="Expected start (optional)">
+            <input type="time" className="lp-input" value={startTime} onChange={(e) => setStartTime(e.target.value)} />
+          </Field>
+          <Field label="Expected finish (optional)">
+            <input type="time" className="lp-input" value={endTime} onChange={(e) => setEndTime(e.target.value)} />
+          </Field>
+        </div>
+        {startTime && endTime && (
+          <p className="lp-hint">Allowing {fmtHours(hoursBetween(startTime, endTime))} — the staff member sees this window, and their task time is pre-filled with it.</p>
+        )}
         {error && <p className="lp-error">{error}</p>}
         <button type="button" className="lp-btn-ghost" onClick={handleAdd} disabled={adding}><Plus size={16} /> {adding ? "Saving…" : added ? "Added" : "Add task"}</button>
         <p className="lp-hint">Add as many as you need — the form clears after each one so you can keep going.</p>
@@ -1482,6 +1521,8 @@ body{margin:0;}
 .lp-assigned-for-you{border:1px solid var(--brass);background:#FBF4E8;border-radius:11px;padding:12px;margin-bottom:14px;}
 .lp-assigned-for-you-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:8px;}
 .lp-assigned-for-you-list li{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;}
+.lp-assigned-window{color:var(--brass-dark);font-style:normal;font-weight:600;}
+.lp-assigned-meta .lp-tag{display:inline-flex;align-items:center;gap:4px;}
 .lp-assigned-add{flex:none;white-space:nowrap;}
 .lp-assigned-add:disabled{opacity:.6;cursor:default;border-style:solid;color:var(--green);border-color:var(--green);}
 .lp-choice{border:1px solid var(--line);background:#FCFBF8;padding:8px 13px;border-radius:20px;font-size:12.5px;cursor:pointer;color:var(--ink);}

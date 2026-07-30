@@ -26,9 +26,14 @@ create table if not exists assigned_tasks (
   date        date not null,
   task_text   text not null,
   assigned_to jsonb default '[]'::jsonb,
+  start_time  text,
+  end_time    text,
   created_at  timestamptz default now(),
   active      boolean default true
 );
+-- For databases created before expected start/finish times existed:
+alter table assigned_tasks add column if not exists start_time text;
+alter table assigned_tasks add column if not exists end_time   text;
 create index if not exists assigned_tasks_active_idx on assigned_tasks (active, date);
 
 create table if not exists app_settings (
