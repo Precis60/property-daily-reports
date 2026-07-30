@@ -3,7 +3,7 @@
 Daily work report system for property maintenance staff, with a PIN-gated manager dashboard.
 
 - **Worker view** — staff pick their name, enter their PIN, and submit a daily field report (tasks, hours, photos, delays, tomorrow's plan).
-- **Manager view** — PIN-gated morning brief, assigned tasks, full searchable log, staff PIN management, and JSON backup/restore.
+- **Manager view** — PIN-gated morning brief, assigned tasks, full searchable log (with permanent delete for mistaken reports), staff PIN management, and JSON backup/restore.
 
 Data is stored in Supabase (`reports`, `assigned_tasks`, `app_settings`) via the REST API.
 
