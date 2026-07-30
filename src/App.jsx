@@ -298,6 +298,21 @@ async function createAssignedTaskInSupabase(task) {
   }
 }
 
+async function updateAssignedTaskInSupabase(id, task, clearAcks) {
+  const base = { date: task.date, task_text: task.text, assigned_to: task.assignedTo };
+  const full = { ...base, start_time: task.startTime || null, end_time: task.endTime || null };
+  if (clearAcks) full.acknowledged_by = [];
+  try {
+    await supabaseFetch(`/assigned_tasks?id=eq.${id}`, { method: "PATCH", body: full });
+  } catch (e) {
+    if (!/start_time|end_time|acknowledged_by/i.test(e.message)) throw e;
+    if (task.startTime || task.endTime) {
+      throw new Error("Expected times need a one-off database update — run supabase/schema.sql in Supabase, or leave the times blank.");
+    }
+    await supabaseFetch(`/assigned_tasks?id=eq.${id}`, { method: "PATCH", body: base });
+  }
+}
+
 async function acknowledgeAssignedTaskInSupabase(id, name) {
   let rows;
   try {
@@ -436,6 +451,11 @@ export default function App() {
     setAssignedTasks(await loadAssignedTasks());
   }
 
+  async function updateAssignedTask(id, task, clearAcks) {
+    await updateAssignedTaskInSupabase(id, task, clearAcks);
+    setAssignedTasks(await loadAssignedTasks());
+  }
+
   async function acknowledgeAssignedTask(id, name) {
     await acknowledgeAssignedTaskInSupabase(id, name);
     setAssignedTasks(await loadAssignedTasks());
@@ -501,6 +521,7 @@ export default function App() {
           onSettingsChange={async (s) => { setSettings(s); await saveSettings(s); }}
           assignedTasks={assignedTasks}
           onDeleteReport={deleteReport}
+          onUpdateAssignedTask={updateAssignedTask}
           onAddAssignedTask={addAssignedTask}
           onRemoveAssignedTask={removeAssignedTask}
           onRestored={handleRestored}
@@ -994,7 +1015,7 @@ function ManagerGate({ pin, onBack, onSuccess }) {
 }
 
 /* ---------------- Manager dashboard ---------------- */
-function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onDeleteReport, onRestored, onExit }) {
+function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onDeleteReport, onRestored, onExit }) {
   const [tab, setTab] = useState("brief");
   return (
     <div className="lp-page lp-page--manager">
@@ -1006,23 +1027,110 @@ function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion,
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
-      {tab === "assign" && <AssignTasksPanel assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} />}
+      {tab === "assign" && <AssignTasksPanel assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
       {tab === "settings" && <ManagerSettings settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
     </div>
   );
 }
 
-function AssignedTaskRow({ task, onRemove }) {
+function AssignedTaskRow({ task, onRemove, onUpdate }) {
+  const NAME_OPTIONS = [...STAFF_NAMES, ...OPEN_CONTRACTOR_SLOTS];
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [draft, setDraft] = useState(null);
+
   async function handleRemove() {
     setRemoving(true);
     setError("");
     try { await onRemove(task.id); }
     catch (e) { setError(e.message || "Couldn't remove — try again."); setRemoving(false); }
   }
+
+  function startEditing() {
+    const names = normalizeAssignedTo(task.assignedTo);
+    setDraft({
+      date: task.date, text: task.text, startTime: task.startTime || "", endTime: task.endTime || "",
+      isAnyone: names.length === 0, names,
+    });
+    setError("");
+    setEditing(true);
+  }
+
+  function toggleDraftName(name) {
+    setDraft((d) => ({
+      ...d, isAnyone: false,
+      names: d.names.includes(name) ? d.names.filter((n) => n !== name) : [...d.names, name],
+    }));
+  }
+
+  async function handleSave() {
+    if (!draft.text.trim()) { setError("Describe the task before saving."); return; }
+    if (!draft.isAnyone && draft.names.length === 0) { setError("Tick who this task is for, or choose Anyone."); return; }
+    if (Boolean(draft.startTime) !== Boolean(draft.endTime)) { setError("Enter both a start and a finish time, or leave both blank."); return; }
+    if (draft.startTime && draft.endTime && hoursBetween(draft.startTime, draft.endTime) === 0) { setError("Finish time must be different to the start time."); return; }
+    const next = {
+      date: draft.date, text: draft.text.trim(), startTime: draft.startTime, endTime: draft.endTime,
+      assignedTo: draft.isAnyone ? [] : draft.names,
+    };
+    const changedSubstance = next.text !== task.text || next.startTime !== (task.startTime || "") || next.endTime !== (task.endTime || "") || next.date !== task.date;
+    setError("");
+    setSaving(true);
+    try {
+      await onUpdate(task.id, next, changedSubstance && (task.acknowledgedBy || []).length > 0);
+      setEditing(false);
+    } catch (e) {
+      setError(e.message || "Couldn't save those changes — try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   const acks = task.acknowledgedBy || [];
+
+  if (editing) {
+    return (
+      <li>
+        <Field label="Date it should appear">
+          <input type="date" className="lp-input" value={draft.date} onChange={(e) => setDraft((d) => ({ ...d, date: e.target.value }))} />
+        </Field>
+        <Field label="Assign to">
+          <div className="lp-checkbox-grid">
+            <label className="lp-checkbox-chip">
+              <input type="checkbox" checked={draft.isAnyone} onChange={() => setDraft((d) => ({ ...d, isAnyone: !d.isAnyone, names: d.isAnyone ? d.names : [] }))} />
+              <span>Anyone</span>
+            </label>
+            {NAME_OPTIONS.map((name) => (
+              <label className="lp-checkbox-chip" key={name}>
+                <input type="checkbox" checked={draft.names.includes(name)} onChange={() => toggleDraftName(name)} />
+                <span>{name}</span>
+              </label>
+            ))}
+          </div>
+        </Field>
+        <Field label="What needs doing">
+          <textarea className="lp-textarea" rows={2} value={draft.text} onChange={(e) => setDraft((d) => ({ ...d, text: e.target.value }))} />
+        </Field>
+        <div className="lp-row2">
+          <Field label="Expected start (optional)">
+            <input type="time" className="lp-input" value={draft.startTime} onChange={(e) => setDraft((d) => ({ ...d, startTime: e.target.value }))} />
+          </Field>
+          <Field label="Expected finish (optional)">
+            <input type="time" className="lp-input" value={draft.endTime} onChange={(e) => setDraft((d) => ({ ...d, endTime: e.target.value }))} />
+          </Field>
+        </div>
+        {acks.length > 0 && <p className="lp-hint">Changing the wording, date or times clears the existing acknowledgement so staff have to confirm again.</p>}
+        {error && <p className="lp-error">{error}</p>}
+        <div className="lp-assigned-edit-actions">
+          <button type="button" className="lp-btn-ghost" onClick={handleSave} disabled={saving}><Check size={13} /> {saving ? "Saving…" : "Save changes"}</button>
+          <button type="button" className="lp-btn-ghost" onClick={() => setEditing(false)} disabled={saving}>Cancel</button>
+        </div>
+      </li>
+    );
+  }
+
   return (
     <li>
       <div className="lp-assigned-meta">
@@ -1041,15 +1149,18 @@ function AssignedTaskRow({ task, onRemove }) {
       ) : (
         <p className="lp-hint"><Clock size={12} /> Not yet acknowledged</p>
       )}
-      <button type="button" className="lp-btn-ghost lp-btn-danger" onClick={handleRemove} disabled={removing}>
-        <Trash2 size={13} /> {removing ? "Removing…" : "Remove"}
-      </button>
+      <div className="lp-assigned-edit-actions">
+        <button type="button" className="lp-btn-ghost" onClick={startEditing}><Settings size={13} /> Edit</button>
+        <button type="button" className="lp-btn-ghost lp-btn-danger" onClick={handleRemove} disabled={removing}>
+          <Trash2 size={13} /> {removing ? "Removing…" : "Remove"}
+        </button>
+      </div>
       {error && <p className="lp-error">{error}</p>}
     </li>
   );
 }
 
-function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
+function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
   const NAME_OPTIONS = [...STAFF_NAMES, ...OPEN_CONTRACTOR_SLOTS];
   const [date, setDate] = useState(todayISO());
   const [isAnyone, setIsAnyone] = useState(true);
@@ -1158,7 +1269,7 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
                   <span className="lp-hint">{acked}/{group.tasks.length} acknowledged</span>
                 </div>
                 <ul className="lp-assigned-list">
-                  {group.tasks.map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} />)}
+                  {group.tasks.map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} onUpdate={onUpdate} />)}
                 </ul>
               </div>
             );
@@ -1617,6 +1728,7 @@ body{margin:0;}
 .lp-assigned-actions{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap;justify-content:flex-end;}
 .lp-ack-chip{font-size:12px;padding:5px 9px;}
 .lp-ack-chip.is-acked{border-color:var(--green);color:var(--green);}
+.lp-assigned-edit-actions{display:flex;gap:8px;flex-wrap:wrap;}
 .lp-assigned-day{border:1px solid var(--line);border-radius:11px;padding:10px 12px;margin-bottom:12px;}
 .lp-assigned-day-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-bottom:8px;border-bottom:1px dashed var(--line);margin-bottom:6px;}
 .lp-assigned-day-date{display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:13px;}
