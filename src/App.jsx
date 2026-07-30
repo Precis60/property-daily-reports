@@ -278,6 +278,7 @@ async function loadAssignedTasks() {
     return (rows || []).map((row) => ({
       id: row.id, date: row.date, text: row.task_text, assignedTo: row.assigned_to || [], createdAt: row.created_at,
       startTime: row.start_time || "", endTime: row.end_time || "",
+      acknowledgedBy: row.acknowledged_by || [],
     }));
   } catch { return []; }
 }
@@ -295,6 +296,37 @@ async function createAssignedTaskInSupabase(task) {
     }
     await supabaseFetch("/assigned_tasks", { method: "POST", body: [base] });
   }
+}
+
+async function acknowledgeAssignedTaskInSupabase(id, name) {
+  let rows;
+  try {
+    rows = await supabaseFetch(`/assigned_tasks?id=eq.${id}&select=acknowledged_by`);
+  } catch (e) {
+    if (/acknowledged_by/i.test(e.message)) {
+      throw new Error("Acknowledgements need a one-off database update — ask your property manager to run supabase/schema.sql.");
+    }
+    throw e;
+  }
+  const current = rows?.[0]?.acknowledged_by || [];
+  if (current.some((a) => (a.name || "").toLowerCase() === name.toLowerCase())) return;
+  const next = [...current, { name, at: new Date().toISOString() }];
+  await supabaseFetch(`/assigned_tasks?id=eq.${id}`, { method: "PATCH", body: { acknowledged_by: next } });
+}
+
+function fmtDayHeading(iso) {
+  const d = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return iso;
+  const label = d.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long" });
+  if (iso === todayISO()) return `Today \u2014 ${label}`;
+  return label;
+}
+
+function fmtAckTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("en-AU", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
 }
 
 function expectedWindowLabel(task) {
@@ -404,6 +436,11 @@ export default function App() {
     setAssignedTasks(await loadAssignedTasks());
   }
 
+  async function acknowledgeAssignedTask(id, name) {
+    await acknowledgeAssignedTaskInSupabase(id, name);
+    setAssignedTasks(await loadAssignedTasks());
+  }
+
   async function removeAssignedTask(id) {
     await deactivateAssignedTaskInSupabase(id);
     setAssignedTasks(await loadAssignedTasks());
@@ -446,6 +483,7 @@ export default function App() {
         <WorkerForm
           presetName={presetName}
           assignedTasks={assignedTasks}
+          onAcknowledge={acknowledgeAssignedTask}
           onBack={() => setView("home")}
           onSubmitted={async (report, photos) => { await addReport(report, photos); setView("submitted"); }}
         />
@@ -521,7 +559,7 @@ function Home({ onWorker, onManager }) {
 }
 
 /* ---------------- Worker Form ---------------- */
-function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks }) {
+function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks, onAcknowledge }) {
   const [workerType, setWorkerType] = useState("");
   const [workerName, setWorkerName] = useState(presetName || "");
   const nameLocked = STAFF_NAMES.includes(presetName);
@@ -531,6 +569,8 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks }) {
   const [taskCountChoice, setTaskCountChoice] = useState("");
   const [tasks, setTasks] = useState([emptyTask()]);
   const [addedAssignedIds, setAddedAssignedIds] = useState([]);
+  const [ackBusy, setAckBusy] = useState(null);
+  const [ackError, setAckError] = useState("");
   const [photos, setPhotos] = useState([]);
   const [photoError, setPhotoError] = useState("");
   const [delays, setDelays] = useState("");
@@ -548,6 +588,21 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks }) {
     if (names.length === 0) return true;
     return names.some((n) => n.toLowerCase() === (workerName || "").trim().toLowerCase());
   });
+
+  function hasAcknowledged(task) {
+    return (task.acknowledgedBy || []).some((a) => (a.name || "").toLowerCase() === workerName.trim().toLowerCase());
+  }
+
+  async function handleAcknowledge(task) {
+    const name = workerName.trim();
+    if (!name) { setAckError("Enter your name at the top before acknowledging a task."); return; }
+    if (hasAcknowledged(task)) return;
+    setAckError("");
+    setAckBusy(task.id);
+    try { await onAcknowledge(task.id, name); }
+    catch (e) { setAckError(e.message || "Couldn't record that — try again."); }
+    finally { setAckBusy(null); }
+  }
 
   function pullInAssignedTask(task) {
     if (addedAssignedIds.includes(task.id) || tasks.length >= MAX_TASKS) return;
@@ -672,13 +727,25 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks }) {
                         {t.text}
                         {expectedWindowLabel(t) && <em className="lp-assigned-window"> — expected {expectedWindowLabel(t)} ({fmtHours(hoursBetween(t.startTime, t.endTime))})</em>}
                       </span>
-                      <button type="button" className="lp-btn-ghost lp-assigned-add" disabled={already} onClick={() => pullInAssignedTask(t)}>
-                        {already ? <><Check size={13} /> Added</> : <><Plus size={13} /> Add to my tasks</>}
-                      </button>
+                      <div className="lp-assigned-actions">
+                        <label className={`lp-checkbox-chip lp-ack-chip ${hasAcknowledged(t) ? "is-acked" : ""}`}>
+                          <input
+                            type="checkbox"
+                            checked={hasAcknowledged(t)}
+                            disabled={hasAcknowledged(t) || ackBusy === t.id}
+                            onChange={() => handleAcknowledge(t)}
+                          />
+                          <span>{hasAcknowledged(t) ? "Seen \u2014 acknowledged" : ackBusy === t.id ? "Saving\u2026" : "I've seen this"}</span>
+                        </label>
+                        <button type="button" className="lp-btn-ghost lp-assigned-add" disabled={already} onClick={() => pullInAssignedTask(t)}>
+                          {already ? <><Check size={13} /> Added</> : <><Plus size={13} /> Add to my tasks</>}
+                        </button>
+                      </div>
                     </li>
                   );
                 })}
               </ul>
+              {ackError && <p className="lp-error">{ackError}</p>}
             </div>
           )}
           <Field label="How many separate tasks did you complete today?"><ChoiceRow options={TASK_COUNT_OPTIONS} value={taskCountChoice} onChange={setTaskCount} /></Field>
@@ -955,16 +1022,25 @@ function AssignedTaskRow({ task, onRemove }) {
     try { await onRemove(task.id); }
     catch (e) { setError(e.message || "Couldn't remove — try again."); setRemoving(false); }
   }
+  const acks = task.acknowledgedBy || [];
   return (
     <li>
       <div className="lp-assigned-meta">
-        <span className="lp-tag">{task.date}</span>
         <span className="lp-tag">{assignedToLabel(task.assignedTo)}</span>
         {expectedWindowLabel(task) && (
           <span className="lp-tag"><Clock size={11} /> {expectedWindowLabel(task)} ({fmtHours(hoursBetween(task.startTime, task.endTime))})</span>
         )}
       </div>
       <p>{task.text}</p>
+      {acks.length > 0 ? (
+        <ul className="lp-ack-list">
+          {acks.map((a, i) => (
+            <li key={i}><Check size={12} /> Acknowledged by {a.name} — {fmtAckTime(a.at)}</li>
+          ))}
+        </ul>
+      ) : (
+        <p className="lp-hint"><Clock size={12} /> Not yet acknowledged</p>
+      )}
       <button type="button" className="lp-btn-ghost lp-btn-danger" onClick={handleRemove} disabled={removing}>
         <Trash2 size={13} /> {removing ? "Removing…" : "Remove"}
       </button>
@@ -1020,6 +1096,12 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
   }
 
   const upcoming = [...assignedTasks].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  const byDate = [];
+  upcoming.forEach((t) => {
+    const group = byDate.find((g) => g.date === t.date);
+    if (group) group.tasks.push(t);
+    else byDate.push({ date: t.date, tasks: [t] });
+  });
 
   return (
     <div className="lp-assign">
@@ -1067,9 +1149,20 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove }) {
         {upcoming.length === 0 ? (
           <EmptyState compact icon={<Check size={16} />} text="No tasks assigned yet." />
         ) : (
-          <ul className="lp-assigned-list">
-            {upcoming.map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} />)}
-          </ul>
+          byDate.map((group) => {
+            const acked = group.tasks.filter((t) => (t.acknowledgedBy || []).length > 0).length;
+            return (
+              <div className="lp-assigned-day" key={group.date}>
+                <div className="lp-assigned-day-head">
+                  <span className="lp-assigned-day-date"><CalendarDays size={13} /> {fmtDayHeading(group.date)}</span>
+                  <span className="lp-hint">{acked}/{group.tasks.length} acknowledged</span>
+                </div>
+                <ul className="lp-assigned-list">
+                  {group.tasks.map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} />)}
+                </ul>
+              </div>
+            );
+          })
         )}
       </div>
     </div>
@@ -1521,6 +1614,13 @@ body{margin:0;}
 .lp-assigned-for-you{border:1px solid var(--brass);background:#FBF4E8;border-radius:11px;padding:12px;margin-bottom:14px;}
 .lp-assigned-for-you-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:8px;}
 .lp-assigned-for-you-list li{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;}
+.lp-assigned-actions{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap;justify-content:flex-end;}
+.lp-ack-chip{font-size:12px;padding:5px 9px;}
+.lp-ack-chip.is-acked{border-color:var(--green);color:var(--green);}
+.lp-assigned-day{border:1px solid var(--line);border-radius:11px;padding:10px 12px;margin-bottom:12px;}
+.lp-assigned-day-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding-bottom:8px;border-bottom:1px dashed var(--line);margin-bottom:6px;}
+.lp-assigned-day-date{display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:13px;}
+.lp-ack-list{margin:6px 0 0;padding:0;list-style:none;font-size:12px;color:var(--green);display:flex;flex-direction:column;gap:2px;}
 .lp-assigned-window{color:var(--brass-dark);font-style:normal;font-weight:600;}
 .lp-assigned-meta .lp-tag{display:inline-flex;align-items:center;gap:4px;}
 .lp-assigned-add{flex:none;white-space:nowrap;}
