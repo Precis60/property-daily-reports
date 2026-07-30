@@ -286,6 +286,9 @@ async function createAssignedTaskInSupabase(task) {
     body: [{ id: task.id, date: task.date, task_text: task.text, assigned_to: task.assignedTo, created_at: task.createdAt, active: true }],
   });
 }
+async function deleteReportInSupabase(id) {
+  await supabaseFetch(`/reports?id=eq.${id}`, { method: "DELETE" });
+}
 async function deactivateAssignedTaskInSupabase(id) {
   await supabaseFetch(`/assigned_tasks?id=eq.${id}`, { method: "PATCH", body: { active: false } });
 }
@@ -373,6 +376,14 @@ export default function App() {
     setCacheVersion((v) => v + 1);
   }
 
+  async function deleteReport(report) {
+    const ym = monthOf(report.date);
+    await deleteReportInSupabase(report.id);
+    cacheRef.current[ym] = await loadMonth(ym);
+    if (cacheRef.current[ym].length === 0) setMonthsIndex((prev) => prev.filter((m) => m !== ym));
+    setCacheVersion((v) => v + 1);
+  }
+
   async function addAssignedTask(task) {
     await createAssignedTaskInSupabase(task);
     setAssignedTasks(await loadAssignedTasks());
@@ -436,6 +447,7 @@ export default function App() {
           settings={settings}
           onSettingsChange={async (s) => { setSettings(s); await saveSettings(s); }}
           assignedTasks={assignedTasks}
+          onDeleteReport={deleteReport}
           onAddAssignedTask={addAssignedTask}
           onRemoveAssignedTask={removeAssignedTask}
           onRestored={handleRestored}
@@ -894,7 +906,7 @@ function ManagerGate({ pin, onBack, onSuccess }) {
 }
 
 /* ---------------- Manager dashboard ---------------- */
-function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onRestored, onExit }) {
+function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onDeleteReport, onRestored, onExit }) {
   const [tab, setTab] = useState("brief");
   return (
     <div className="lp-page lp-page--manager">
@@ -907,7 +919,7 @@ function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion,
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
       {tab === "assign" && <AssignTasksPanel assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} />}
-      {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} />}
+      {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
       {tab === "settings" && <ManagerSettings settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
     </div>
   );
@@ -1183,7 +1195,7 @@ function DailySummaryPanel({ reports, date }) {
   );
 }
 
-function FullLog({ monthsIndex, getMonths, cacheVersion }) {
+function FullLog({ monthsIndex, getMonths, cacheVersion, onDeleteReport }) {
   const [selectedYm, setSelectedYm] = useState(monthOf(todayISO()));
   const [monthReports, setMonthReports] = useState([]);
   const [busy, setBusy] = useState(true);
@@ -1230,7 +1242,7 @@ function FullLog({ monthsIndex, getMonths, cacheVersion }) {
       ) : (
         <div className="lp-log-list">
           {filtered.map((r) => (
-            <LogEntry key={r.id} report={r} open={expanded === r.id} onToggle={() => setExpanded(expanded === r.id ? null : r.id)} />
+            <LogEntry key={r.id} report={r} open={expanded === r.id} onToggle={() => setExpanded(expanded === r.id ? null : r.id)} onDelete={onDeleteReport} />
           ))}
         </div>
       )}
@@ -1238,8 +1250,19 @@ function FullLog({ monthsIndex, getMonths, cacheVersion }) {
   );
 }
 
-function LogEntry({ report, open, onToggle }) {
+function LogEntry({ report, open, onToggle, onDelete }) {
   const [photos, setPhotos] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteErr, setDeleteErr] = useState("");
+
+  async function handleDelete() {
+    setDeleting(true);
+    setDeleteErr("");
+    try { await onDelete(report); }
+    catch (e) { setDeleteErr(e.message || "Couldn't delete that report — try again."); setDeleting(false); }
+  }
+
   useEffect(() => { if (open && photos === null) loadPhotos(report.id).then(setPhotos); }, [open]);
   const completeCount = report.tasks.filter((t) => t.status === "Complete").length;
 
@@ -1282,6 +1305,24 @@ function LogEntry({ report, open, onToggle }) {
               : photos.length === 0 ? <span className="lp-hint"><ImageOff size={13} /> No photos found</span>
               : photos.map((p, i) => <div className="lp-photo-thumb" key={i}><img src={p} alt={`Photo ${i + 1}`} /></div>)}
           </div>
+          {onDelete && (
+            <div className="lp-log-delete">
+              {confirming ? (
+                <>
+                  <p className="lp-error"><AlertTriangle size={13} /> Permanently delete this report and its photos? This can't be undone.</p>
+                  <div className="lp-log-delete-actions">
+                    <button type="button" className="lp-btn-ghost lp-btn-danger" onClick={handleDelete} disabled={deleting}>
+                      <Trash2 size={13} /> {deleting ? "Deleting…" : "Yes, delete it"}
+                    </button>
+                    <button type="button" className="lp-btn-ghost" onClick={() => setConfirming(false)} disabled={deleting}>Cancel</button>
+                  </div>
+                </>
+              ) : (
+                <button type="button" className="lp-btn-ghost lp-btn-danger" onClick={() => setConfirming(true)}><Trash2 size={13} /> Delete this report</button>
+              )}
+              {deleteErr && <p className="lp-error">{deleteErr}</p>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1562,6 +1603,8 @@ body{margin:0;}
 .lp-status-pill{font-size:10px;padding:3px 8px;border-radius:8px;font-weight:600;background:#E4EFE5;color:var(--green);white-space:nowrap;}
 .lp-status-pill--ongoing{background:#FBF0E2;color:var(--amber);}
 .lp-status-pill--waiting-on-materials,.lp-status-pill--waiting-on-instruction{background:#FBEAE7;color:var(--rust);}
+.lp-log-delete{border-top:1px dashed var(--line);padding-top:10px;margin-top:2px;}
+.lp-log-delete-actions{display:flex;gap:8px;margin-top:8px;}
 .lp-checkfail{display:inline-flex;align-items:center;gap:4px;color:var(--rust);font-weight:600;}
 
 .lp-settings{padding:20px 16px;max-width:420px;}
