@@ -366,13 +366,6 @@ function expectedWindowLabel(task) {
   if (!task.startTime || !task.endTime) return "";
   return `${fmtTime12(task.startTime)}\u2013${fmtTime12(task.endTime)}`;
 }
-async function loadSites() {
-  try {
-    const rows = await supabaseFetch("/sites?active=eq.true&select=id,name,address&order=id");
-    return rows || [];
-  } catch { return []; }
-}
-
 async function loadPeople() {
   try {
     const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role,pin&order=sort_order,name");
@@ -395,6 +388,54 @@ async function savePersonSites(personId, siteIds) {
     method: "POST",
     body: siteIds.map((siteId) => ({ person_id: personId, site_id: siteId })),
   });
+}
+
+// Admin views need inactive rows too; the app-wide loaders only fetch active ones.
+async function loadAllSites() {
+  try {
+    const rows = await supabaseFetch("/sites?select=id,name,address,active&order=id");
+    return rows || [];
+  } catch { return []; }
+}
+
+async function loadAllPeople() {
+  try {
+    const rows = await supabaseFetch("/people?select=id,name,role,pin,active,sort_order&order=sort_order,name");
+    return rows || [];
+  } catch { return []; }
+}
+
+async function createSite(site) {
+  await supabaseFetch("/sites", { method: "POST", body: [site] });
+}
+
+async function setSiteActive(siteId, active) {
+  await supabaseFetch(`/sites?id=eq.${siteId}`, { method: "PATCH", body: { active } });
+}
+
+async function createPerson(person) {
+  await supabaseFetch("/people", { method: "POST", body: [person] });
+}
+
+async function updatePerson(personId, patch) {
+  await supabaseFetch(`/people?id=eq.${personId}`, { method: "PATCH", body: patch });
+}
+
+// site-01 … site-16 are sequential, so the next one continues the run.
+function nextSiteId(sites) {
+  const highest = sites.reduce((max, s) => {
+    const n = parseInt(String(s.id).replace(/\D/g, ""), 10);
+    return Number.isNaN(n) ? max : Math.max(max, n);
+  }, 0);
+  return `site-${String(highest + 1).padStart(2, "0")}`;
+}
+
+function personIdFrom(name, taken) {
+  const base = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "person";
+  let id = base;
+  let n = 2;
+  while (taken.includes(id)) { id = `${base}-${n}`; n += 1; }
+  return id;
 }
 
 async function loadManagerSchedule(ownerId) {
@@ -1164,7 +1205,7 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
         <button className={`lp-tab ${tab === "myreport" ? "is-active" : ""}`} onClick={() => { setReportSaved(false); setTab("myreport"); }}>Daily Work Report</button>
         <button className={`lp-tab ${tab === "schedule" ? "is-active" : ""}`} onClick={() => setTab("schedule")}>Manager schedule</button>
         <button className={`lp-tab ${tab === "log" ? "is-active" : ""}`} onClick={() => setTab("log")}>Full log</button>
-        <button className={`lp-tab ${tab === "sites" ? "is-active" : ""}`} onClick={() => setTab("sites")}>Sites &amp; people</button>
+        <button className={`lp-tab ${tab === "sites" ? "is-active" : ""}`} onClick={() => setTab("sites")}>Admin</button>
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
@@ -1190,7 +1231,7 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
       )}
       {tab === "schedule" && <ManagerSchedulePanel managers={managers} currentManager={currentManager} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
-      {tab === "sites" && <SitesPeoplePanel />}
+      {tab === "sites" && <AdminPanel />}
       {tab === "settings" && <ManagerSettings workers={workers} settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
     </div>
   );
@@ -1968,175 +2009,315 @@ function LogEntry({ report, open, onToggle, onDelete }) {
 }
 
 /* ---------------- Sites & people ---------------- */
-function SitesPeoplePanel() {
+function AdminPanel() {
+  const [adminTab, setAdminTab] = useState("sites");
   const [sites, setSites] = useState([]);
   const [people, setPeople] = useState([]);
   const [assignments, setAssignments] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [editing, setEditing] = useState(null); // person id
-  const [draft, setDraft] = useState([]);       // site ids being edited
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
   const [editingSite, setEditingSite] = useState(null);
   const [siteDraft, setSiteDraft] = useState({ name: "", address: "" });
-  const [savingSite, setSavingSite] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState("");
+  const [newSite, setNewSite] = useState({ name: "", address: "" });
+  const [addingSite, setAddingSite] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      const [s, p, a] = await Promise.all([loadSites(), loadPeople(), loadSiteAssignments()]);
-      setSites(s); setPeople(p); setAssignments(a); setLoading(false);
-    })();
-  }, []);
+  const [editingPerson, setEditingPerson] = useState(null);
+  const [personDraft, setPersonDraft] = useState({ name: "", role: "staff", pin: "" });
+  const [newPerson, setNewPerson] = useState({ name: "", role: "staff", pin: "" });
+  const [addingPerson, setAddingPerson] = useState(false);
+  const [editingSitesFor, setEditingSitesFor] = useState(null);
+  const [siteDraftIds, setSiteDraftIds] = useState([]);
 
-  const sitesFor = (personId) =>
-    assignments.filter((a) => a.person_id === personId).map((a) => a.site_id);
+  async function refresh() {
+    const [s, p, a] = await Promise.all([loadAllSites(), loadAllPeople(), loadSiteAssignments()]);
+    setSites(s); setPeople(p); setAssignments(a);
+  }
+
+  useEffect(() => { (async () => { await refresh(); setLoading(false); })(); }, []);
+
+  const sitesFor = (personId) => assignments.filter((a) => a.person_id === personId).map((a) => a.site_id);
   const siteName = (id) => sites.find((s) => s.id === id)?.name || id;
 
-  function startEdit(person) {
-    setErr("");
-    setEditing(person.id);
-    setDraft(sitesFor(person.id));
-  }
-
-  function toggleSite(siteId) {
-    setDraft((d) => (d.includes(siteId) ? d.filter((s) => s !== siteId) : [...d, siteId]));
-  }
-
-  async function save(personId) {
-    setSaving(true); setErr("");
+  // Every write goes through here so one failure can't leave the list stale.
+  async function run(fn, fallbackMessage) {
+    setBusy(true); setErr("");
     try {
-      await savePersonSites(personId, draft);
-      setAssignments(await loadSiteAssignments());
-      setEditing(null);
+      await fn();
+      await refresh();
+      return true;
     } catch (e) {
-      setErr(e.message || "Couldn't save those site assignments — try again.");
+      setErr(e.message || fallbackMessage);
+      return false;
+    } finally {
+      setBusy(false);
     }
-    setSaving(false);
   }
 
-  function startSiteEdit(site) {
-    setErr("");
-    setEditingSite(site.id);
-    setSiteDraft({ name: site.name, address: site.address || "" });
+  async function addSite() {
+    if (!newSite.name.trim()) { setErr("A site needs a name."); return; }
+    const ok = await run(() => createSite({
+      id: nextSiteId(sites),
+      name: newSite.name.trim(),
+      address: newSite.address.trim() || null,
+      active: true,
+    }), "Couldn't add that site — try again.");
+    if (ok) { setNewSite({ name: "", address: "" }); setAddingSite(false); }
   }
 
   async function saveSite(siteId) {
     if (!siteDraft.name.trim()) { setErr("A site needs a name."); return; }
-    setSavingSite(true); setErr("");
-    try {
-      await saveSiteDetails(siteId, siteDraft.name.trim(), siteDraft.address.trim());
-      setSites(await loadSites());
-      setEditingSite(null);
-    } catch (e) {
-      setErr(e.message || "Couldn't save that site — try again.");
+    const ok = await run(() => saveSiteDetails(siteId, siteDraft.name.trim(), siteDraft.address.trim()),
+      "Couldn't save that site — try again.");
+    if (ok) setEditingSite(null);
+  }
+
+  async function addPerson() {
+    if (!newPerson.name.trim()) { setErr("Enter a name."); return; }
+    if (!/^\d{4}$/.test(newPerson.pin.trim())) { setErr("PINs are 4 digits."); return; }
+    if (people.some((p) => p.active && p.pin === newPerson.pin.trim())) { setErr("That PIN is already in use."); return; }
+    const ok = await run(() => createPerson({
+      id: personIdFrom(newPerson.name, people.map((p) => p.id)),
+      name: newPerson.name.trim(),
+      role: newPerson.role,
+      pin: newPerson.pin.trim(),
+      active: true,
+      sort_order: people.reduce((max, p) => Math.max(max, p.sort_order || 0), 0) + 1,
+    }), "Couldn't add that person — try again.");
+    if (ok) { setNewPerson({ name: "", role: "staff", pin: "" }); setAddingPerson(false); }
+  }
+
+  async function savePerson(personId) {
+    if (!personDraft.name.trim()) { setErr("Enter a name."); return; }
+    if (!/^\d{4}$/.test(personDraft.pin.trim())) { setErr("PINs are 4 digits."); return; }
+    if (people.some((p) => p.active && p.id !== personId && p.pin === personDraft.pin.trim())) {
+      setErr("That PIN is already in use."); return;
     }
-    setSavingSite(false);
+    const ok = await run(() => updatePerson(personId, {
+      name: personDraft.name.trim(), role: personDraft.role, pin: personDraft.pin.trim(),
+    }), "Couldn't save that person — try again.");
+    if (ok) setEditingPerson(null);
+  }
+
+  async function saveSitesFor(personId) {
+    const ok = await run(() => savePersonSites(personId, siteDraftIds),
+      "Couldn't save those site assignments — try again.");
+    if (ok) setEditingSitesFor(null);
+  }
+
+  function toggleSiteId(siteId) {
+    setSiteDraftIds((d) => (d.includes(siteId) ? d.filter((s) => s !== siteId) : [...d, siteId]));
   }
 
   if (loading) return <div className="lp-settings"><p className="lp-hint">Loading sites and people…</p></div>;
 
-  const workers = people.filter((p) => p.role !== "manager");
-  const managers = people.filter((p) => p.role === "manager");
+  const activeSites = sites.filter((s) => s.active);
 
   return (
     <div className="lp-settings">
-      <h3><Building2 size={16} /> Sites</h3>
-      <p className="lp-hint">{sites.length} site{sites.length === 1 ? "" : "s"}. The code stays the same when you rename a site, so history stays linked.</p>
-      <div className="lp-person-list">
-        {sites.map((s) => (
-          <div className="lp-person-row" key={s.id}>
-            {editingSite === s.id ? (
-              <>
-                <div className="lp-row2">
-                  <Field label="Site name">
-                    <input className="lp-input" value={siteDraft.name}
-                      onChange={(e) => setSiteDraft((d) => ({ ...d, name: e.target.value }))} />
-                  </Field>
-                  <Field label="Address">
-                    <input className="lp-input" value={siteDraft.address} placeholder="e.g. 14 Riverbend Rd, Kenthurst"
-                      onChange={(e) => setSiteDraft((d) => ({ ...d, address: e.target.value }))} />
-                  </Field>
-                </div>
-                <div className="lp-person-actions">
-                  <button className="lp-btn-ghost" onClick={() => saveSite(s.id)} disabled={savingSite}>
-                    <Check size={13} /> {savingSite ? "Saving…" : "Save site"}
-                  </button>
-                  <button className="lp-btn-ghost" onClick={() => setEditingSite(null)}><X size={13} /> Cancel</button>
-                </div>
-              </>
-            ) : (
-              <div className="lp-person-head">
-                <div>
-                  <strong>{s.name}</strong> <code className="lp-site-code">{s.id.toUpperCase()}</code>
-                  <span className="lp-worker-type">{s.address || "No address yet"}</span>
-                </div>
-                <button className="lp-btn-ghost" onClick={() => startSiteEdit(s)}><Settings size={13} /> Edit</button>
-              </div>
-            )}
-          </div>
-        ))}
+      <div className="lp-subtabs">
+        <button className={`lp-tab ${adminTab === "sites" ? "is-active" : ""}`} onClick={() => { setErr(""); setAdminTab("sites"); }}>
+          <Building2 size={14} /> Sites
+        </button>
+        <button className={`lp-tab ${adminTab === "people" ? "is-active" : ""}`} onClick={() => { setErr(""); setAdminTab("people"); }}>
+          <Users size={14} /> People
+        </button>
       </div>
 
-      <hr className="lp-settings-divider" />
-
-      <h3><Users size={16} /> Site access</h3>
-      <p className="lp-hint">
-        Tick any combination of sites for each person. Managers see every site automatically.
-      </p>
       {err && <p className="lp-error">{err}</p>}
 
-      <div className="lp-person-list">
-        {workers.map((person) => {
-          const current = sitesFor(person.id);
-          const isEditing = editing === person.id;
-          return (
-            <div className="lp-person-row" key={person.id}>
-              <div className="lp-person-head">
-                <div>
-                  <strong>{person.name}</strong>
-                  <span className="lp-worker-type">{roleLabel(person.role)}</span>
-                </div>
-                {!isEditing && (
-                  <button className="lp-btn-ghost" onClick={() => startEdit(person)}>
-                    Edit sites
-                  </button>
+      {adminTab === "sites" && (
+        <>
+          <p className="lp-hint">
+            {activeSites.length} active of {sites.length}. A site's code never changes, so renaming keeps its history attached.
+            Deactivating hides it from new work without touching past reports.
+          </p>
+
+          {addingSite ? (
+            <div className="lp-person-row">
+              <div className="lp-row2">
+                <Field label="Site name">
+                  <input className="lp-input" value={newSite.name} placeholder="e.g. Riverbend Estate"
+                    onChange={(e) => setNewSite((d) => ({ ...d, name: e.target.value }))} />
+                </Field>
+                <Field label="Address">
+                  <input className="lp-input" value={newSite.address} placeholder="Optional"
+                    onChange={(e) => setNewSite((d) => ({ ...d, address: e.target.value }))} />
+                </Field>
+              </div>
+              <p className="lp-hint">It'll be created as <code className="lp-site-code">{nextSiteId(sites).toUpperCase()}</code>.</p>
+              <div className="lp-person-actions">
+                <button className="lp-btn-ghost" onClick={addSite} disabled={busy}><Check size={13} /> {busy ? "Adding…" : "Add site"}</button>
+                <button className="lp-btn-ghost" onClick={() => { setAddingSite(false); setErr(""); }}><X size={13} /> Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <button className="lp-btn-ghost" onClick={() => { setAddingSite(true); setErr(""); }}><Plus size={15} /> Add a site</button>
+          )}
+
+          <div className="lp-person-list">
+            {sites.map((s) => (
+              <div className={`lp-person-row ${s.active ? "" : "is-inactive"}`} key={s.id}>
+                {editingSite === s.id ? (
+                  <>
+                    <div className="lp-row2">
+                      <Field label="Site name">
+                        <input className="lp-input" value={siteDraft.name}
+                          onChange={(e) => setSiteDraft((d) => ({ ...d, name: e.target.value }))} />
+                      </Field>
+                      <Field label="Address">
+                        <input className="lp-input" value={siteDraft.address} placeholder="e.g. 14 Riverbend Rd, Kenthurst"
+                          onChange={(e) => setSiteDraft((d) => ({ ...d, address: e.target.value }))} />
+                      </Field>
+                    </div>
+                    <div className="lp-person-actions">
+                      <button className="lp-btn-ghost" onClick={() => saveSite(s.id)} disabled={busy}>
+                        <Check size={13} /> {busy ? "Saving…" : "Save site"}
+                      </button>
+                      <button className="lp-btn-ghost" onClick={() => { setEditingSite(null); setErr(""); }}><X size={13} /> Cancel</button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="lp-person-head">
+                    <div>
+                      <strong>{s.name}</strong> <code className="lp-site-code">{s.id.toUpperCase()}</code>
+                      {!s.active && <span className="lp-tag">Inactive</span>}
+                      <span className="lp-worker-type">{s.address || "No address yet"}</span>
+                    </div>
+                    <div className="lp-person-actions">
+                      <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingSite(s.id); setSiteDraft({ name: s.name, address: s.address || "" }); }}>
+                        <Settings size={13} /> Edit
+                      </button>
+                      <button className="lp-btn-ghost" disabled={busy}
+                        onClick={() => run(() => setSiteActive(s.id, !s.active), "Couldn't change that site — try again.")}>
+                        {s.active ? "Deactivate" : "Reactivate"}
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
+            ))}
+          </div>
+        </>
+      )}
 
-              {isEditing ? (
-                <>
-                  <div className="lp-site-picker">
-                    {sites.map((s) => (
-                      <label className={`lp-site-option ${draft.includes(s.id) ? "is-on" : ""}`} key={s.id}>
-                        <input type="checkbox" checked={draft.includes(s.id)} onChange={() => toggleSite(s.id)} />
-                        <span>{s.name}</span>
-                      </label>
-                    ))}
-                  </div>
-                  <div className="lp-person-actions">
-                    <button className="lp-btn-ghost" onClick={() => setDraft(sites.map((s) => s.id))}>All sites</button>
-                    <button className="lp-btn-ghost" onClick={() => setDraft([])}>None</button>
-                    <button className="lp-btn-ghost" onClick={() => save(person.id)} disabled={saving}>
-                      {saving ? "Saving…" : "Save"}
-                    </button>
-                    <button className="lp-btn-ghost" onClick={() => setEditing(null)}>Cancel</button>
-                  </div>
-                </>
-              ) : current.length ? (
-                <div className="lp-site-chips">
-                  {current.map((id) => <span className="lp-tag" key={id}>{siteName(id)}</span>)}
-                </div>
-              ) : (
-                <p className="lp-hint lp-hint--muted">No sites yet.</p>
-              )}
+      {adminTab === "people" && (
+        <>
+          <p className="lp-hint">
+            Staff and contractors see only the sites ticked for them. Managers see every site, so they have no site list.
+          </p>
+
+          {addingPerson ? (
+            <div className="lp-person-row">
+              <div className="lp-row2">
+                <Field label="Name">
+                  <input className="lp-input" value={newPerson.name} placeholder="Full name"
+                    onChange={(e) => setNewPerson((d) => ({ ...d, name: e.target.value }))} />
+                </Field>
+                <Field label="Login PIN">
+                  <input className="lp-input" value={newPerson.pin} inputMode="numeric" maxLength={4} placeholder="4 digits"
+                    onChange={(e) => setNewPerson((d) => ({ ...d, pin: e.target.value }))} />
+                </Field>
+              </div>
+              <Field label="Role">
+                <ChoiceRow options={["Staff", "Contractor", "Manager"]} value={roleLabel(newPerson.role)}
+                  onChange={(v) => setNewPerson((d) => ({ ...d, role: v.toLowerCase() }))} />
+              </Field>
+              <div className="lp-person-actions">
+                <button className="lp-btn-ghost" onClick={addPerson} disabled={busy}><Check size={13} /> {busy ? "Adding…" : "Add person"}</button>
+                <button className="lp-btn-ghost" onClick={() => { setAddingPerson(false); setErr(""); }}><X size={13} /> Cancel</button>
+              </div>
             </div>
-          );
-        })}
-      </div>
+          ) : (
+            <button className="lp-btn-ghost" onClick={() => { setAddingPerson(true); setErr(""); }}><Plus size={15} /> Add a person</button>
+          )}
 
-      <p className="lp-hint lp-settings-note">
-        Managers with full access: {managers.map((m) => m.name).join(", ") || "none"}.
-      </p>
+          <div className="lp-person-list">
+            {people.map((person) => {
+              const current = sitesFor(person.id);
+              const isManager = person.role === "manager";
+              return (
+                <div className={`lp-person-row ${person.active ? "" : "is-inactive"}`} key={person.id}>
+                  {editingPerson === person.id ? (
+                    <>
+                      <div className="lp-row2">
+                        <Field label="Name">
+                          <input className="lp-input" value={personDraft.name}
+                            onChange={(e) => setPersonDraft((d) => ({ ...d, name: e.target.value }))} />
+                        </Field>
+                        <Field label="Login PIN">
+                          <input className="lp-input" value={personDraft.pin} inputMode="numeric" maxLength={4}
+                            onChange={(e) => setPersonDraft((d) => ({ ...d, pin: e.target.value }))} />
+                        </Field>
+                      </div>
+                      <Field label="Role">
+                        <ChoiceRow options={["Staff", "Contractor", "Manager"]} value={roleLabel(personDraft.role)}
+                          onChange={(v) => setPersonDraft((d) => ({ ...d, role: v.toLowerCase() }))} />
+                      </Field>
+                      <div className="lp-person-actions">
+                        <button className="lp-btn-ghost" onClick={() => savePerson(person.id)} disabled={busy}>
+                          <Check size={13} /> {busy ? "Saving…" : "Save"}
+                        </button>
+                        <button className="lp-btn-ghost" onClick={() => { setEditingPerson(null); setErr(""); }}><X size={13} /> Cancel</button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="lp-person-head">
+                      <div>
+                        <strong>{person.name}</strong>
+                        {!person.active && <span className="lp-tag">Inactive</span>}
+                        <span className="lp-worker-type">{roleLabel(person.role)} · PIN {person.pin || "—"}</span>
+                      </div>
+                      <div className="lp-person-actions">
+                        <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingPerson(person.id); setPersonDraft({ name: person.name, role: person.role, pin: person.pin || "" }); }}>
+                          <Settings size={13} /> Edit
+                        </button>
+                        {!isManager && (
+                          <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingSitesFor(person.id); setSiteDraftIds(current); }}>
+                            Edit sites
+                          </button>
+                        )}
+                        <button className="lp-btn-ghost" disabled={busy}
+                          onClick={() => run(() => updatePerson(person.id, { active: !person.active }), "Couldn't change that person — try again.")}>
+                          {person.active ? "Deactivate" : "Reactivate"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {editingSitesFor === person.id ? (
+                    <>
+                      <div className="lp-site-picker">
+                        {activeSites.map((s) => (
+                          <label className={`lp-site-option ${siteDraftIds.includes(s.id) ? "is-on" : ""}`} key={s.id}>
+                            <input type="checkbox" checked={siteDraftIds.includes(s.id)} onChange={() => toggleSiteId(s.id)} />
+                            <span>{s.name}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="lp-person-actions">
+                        <button className="lp-btn-ghost" onClick={() => setSiteDraftIds(activeSites.map((s) => s.id))}>All sites</button>
+                        <button className="lp-btn-ghost" onClick={() => setSiteDraftIds([])}>None</button>
+                        <button className="lp-btn-ghost" onClick={() => saveSitesFor(person.id)} disabled={busy}>{busy ? "Saving…" : "Save"}</button>
+                        <button className="lp-btn-ghost" onClick={() => { setEditingSitesFor(null); setErr(""); }}>Cancel</button>
+                      </div>
+                    </>
+                  ) : isManager ? (
+                    <p className="lp-hint lp-hint--muted">All sites.</p>
+                  ) : current.length ? (
+                    <div className="lp-site-chips">
+                      {current.map((id) => <span className="lp-tag" key={id}>{siteName(id)}</span>)}
+                    </div>
+                  ) : (
+                    <p className="lp-hint lp-hint--muted">No sites yet.</p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -2392,6 +2573,9 @@ body{margin:0;}
 .lp-site-option{display:flex;align-items:center;gap:7px;font-size:12.5px;border:1px solid var(--line);border-radius:9px;padding:7px 9px;cursor:pointer;}
 .lp-site-option.is-on{border-color:var(--brass);background:var(--stone);}
 .lp-hint--muted{margin:8px 0 0;}
+.lp-person-row.is-inactive{opacity:.55;}
+.lp-subtabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:12px;}
+.lp-subtabs .lp-tab{display:flex;align-items:center;gap:6px;padding:8px 12px;}
 
 .lp-tabs{display:flex;gap:6px;padding:12px 16px 0;border-bottom:1px solid var(--line);overflow-x:auto;}
 .lp-tab{background:none;border:none;padding:10px 14px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;}
