@@ -412,6 +412,10 @@ async function updateScheduleItem(id, patch) {
   await supabaseFetch(`/manager_schedule?id=eq.${id}`, { method: "PATCH", body: patch });
 }
 
+async function saveSiteDetails(siteId, name, address) {
+  await supabaseFetch(`/sites?id=eq.${siteId}`, { method: "PATCH", body: { name, address: address || null } });
+}
+
 async function savePersonPin(personId, pin) {
   await supabaseFetch(`/people?id=eq.${personId}`, { method: "PATCH", body: { pin } });
 }
@@ -1948,6 +1952,9 @@ function SitesPeoplePanel() {
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(null); // person id
   const [draft, setDraft] = useState([]);       // site ids being edited
+  const [editingSite, setEditingSite] = useState(null);
+  const [siteDraft, setSiteDraft] = useState({ name: "", address: "" });
+  const [savingSite, setSavingSite] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
 
@@ -1984,6 +1991,25 @@ function SitesPeoplePanel() {
     setSaving(false);
   }
 
+  function startSiteEdit(site) {
+    setErr("");
+    setEditingSite(site.id);
+    setSiteDraft({ name: site.name, address: site.address || "" });
+  }
+
+  async function saveSite(siteId) {
+    if (!siteDraft.name.trim()) { setErr("A site needs a name."); return; }
+    setSavingSite(true); setErr("");
+    try {
+      await saveSiteDetails(siteId, siteDraft.name.trim(), siteDraft.address.trim());
+      setSites(await loadSites());
+      setEditingSite(null);
+    } catch (e) {
+      setErr(e.message || "Couldn't save that site — try again.");
+    }
+    setSavingSite(false);
+  }
+
   if (loading) return <div className="lp-settings"><p className="lp-hint">Loading sites and people…</p></div>;
 
   const workers = people.filter((p) => p.role !== "manager");
@@ -1992,10 +2018,39 @@ function SitesPeoplePanel() {
   return (
     <div className="lp-settings">
       <h3><Building2 size={16} /> Sites</h3>
-      <p className="lp-hint">{sites.length} site{sites.length === 1 ? "" : "s"}. Names and addresses can be updated later.</p>
-      <div className="lp-site-chips">
+      <p className="lp-hint">{sites.length} site{sites.length === 1 ? "" : "s"}. The code stays the same when you rename a site, so history stays linked.</p>
+      <div className="lp-person-list">
         {sites.map((s) => (
-          <span className="lp-tag" key={s.id}>{s.name} <code className="lp-site-code">{s.id.toUpperCase()}</code></span>
+          <div className="lp-person-row" key={s.id}>
+            {editingSite === s.id ? (
+              <>
+                <div className="lp-row2">
+                  <Field label="Site name">
+                    <input className="lp-input" value={siteDraft.name}
+                      onChange={(e) => setSiteDraft((d) => ({ ...d, name: e.target.value }))} />
+                  </Field>
+                  <Field label="Address">
+                    <input className="lp-input" value={siteDraft.address} placeholder="e.g. 14 Riverbend Rd, Kenthurst"
+                      onChange={(e) => setSiteDraft((d) => ({ ...d, address: e.target.value }))} />
+                  </Field>
+                </div>
+                <div className="lp-person-actions">
+                  <button className="lp-btn-ghost" onClick={() => saveSite(s.id)} disabled={savingSite}>
+                    <Check size={13} /> {savingSite ? "Saving…" : "Save site"}
+                  </button>
+                  <button className="lp-btn-ghost" onClick={() => setEditingSite(null)}><X size={13} /> Cancel</button>
+                </div>
+              </>
+            ) : (
+              <div className="lp-person-head">
+                <div>
+                  <strong>{s.name}</strong> <code className="lp-site-code">{s.id.toUpperCase()}</code>
+                  <span className="lp-worker-type">{s.address || "No address yet"}</span>
+                </div>
+                <button className="lp-btn-ghost" onClick={() => startSiteEdit(s)}><Settings size={13} /> Edit</button>
+              </div>
+            )}
+          </div>
         ))}
       </div>
 
