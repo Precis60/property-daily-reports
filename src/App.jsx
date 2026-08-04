@@ -634,6 +634,8 @@ export default function App() {
           settings={settings}
           onSettingsChange={async (s) => { setSettings(s); await saveSettings(s); }}
           assignedTasks={assignedTasks}
+          onAcknowledgeAssignedTask={acknowledgeAssignedTask}
+          onAddReport={addReport}
           onDeleteReport={deleteReport}
           onUpdateAssignedTask={updateAssignedTask}
           onAddAssignedTask={addAssignedTask}
@@ -711,7 +713,7 @@ function Home({ workers, managers, onWorker, onManager }) {
 }
 
 /* ---------------- Worker Form ---------------- */
-function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge }) {
+function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, embedded = false, requirePhotos = true }) {
   const [workerType, setWorkerType] = useState("");
   const [workerName, setWorkerName] = useState(presetName || "");
   const nameLocked = Boolean(presetName);
@@ -807,7 +809,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
         if ((!t.jointWith || t.jointWith.length === 0) && !hasOther) return `Task ${i + 1}: tick who you worked with.`;
       }
     }
-    if (photos.length < 3) return "Upload at least 3 photos.";
+    if (requirePhotos && photos.length < 3) return "Upload at least 3 photos.";
     if (!delays) return "Select whether anything delayed today's work.";
     if (delays === "Yes" && !delayExplain.trim()) return "Explain what caused the delay.";
     if (!tomorrow.trim()) return "Enter what should be completed tomorrow.";
@@ -847,8 +849,8 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
   }
 
   return (
-    <div className="lp-page">
-      <TopBar title="Daily Work Report" onBack={onBack} />
+    <div className={embedded ? "" : "lp-page"}>
+      {!embedded && <TopBar title="Daily Work Report" onBack={onBack} />}
       <div className="lp-form">
         <Section n="1" title="About today">
           <Field label="Worker type"><ChoiceRow options={["Full-time Employee", "Subcontractor"]} value={workerType} onChange={setWorkerType} /></Field>
@@ -913,7 +915,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
           )}
         </Section>
 
-        <Section n="3" title="Photos" hint="Upload at least 3 photos of today's work">
+        <Section n="3" title="Photos" hint={requirePhotos ? "Upload at least 3 photos of today's work" : "Optional — add photos if they're useful"}>
           <div className="lp-photo-grid">
             {photos.map((p, idx) => (
               <div className="lp-photo-thumb" key={idx}>
@@ -931,7 +933,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
               </label>
             )}
           </div>
-          <p className="lp-hint">{photos.length}/3 minimum uploaded</p>
+          <p className="lp-hint">{requirePhotos ? `${photos.length}/3 minimum uploaded` : `${photos.length} added`}</p>
           {photoError && <p className="lp-error">{photoError}</p>}
         </Section>
 
@@ -1150,14 +1152,16 @@ function ManagerGate({ managerName, pin, extraPins = [], onBack, onSuccess }) {
 }
 
 /* ---------------- Manager dashboard ---------------- */
-function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onDeleteReport, onRestored, onExit }) {
+function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onAcknowledgeAssignedTask, onAddReport, onDeleteReport, onRestored, onExit }) {
   const [tab, setTab] = useState("brief");
+  const [reportSaved, setReportSaved] = useState(false);
   return (
     <div className="lp-page lp-page--manager">
       <TopBar title="Manager dashboard" onBack={onExit} right={<button className="lp-signout" onClick={onExit}><LogOut size={15} /> Sign out</button>} />
       <div className="lp-tabs">
         <button className={`lp-tab ${tab === "brief" ? "is-active" : ""}`} onClick={() => setTab("brief")}>Morning brief</button>
         <button className={`lp-tab ${tab === "assign" ? "is-active" : ""}`} onClick={() => setTab("assign")}>Assign tasks</button>
+        <button className={`lp-tab ${tab === "myreport" ? "is-active" : ""}`} onClick={() => { setReportSaved(false); setTab("myreport"); }}>Daily Work Report</button>
         <button className={`lp-tab ${tab === "schedule" ? "is-active" : ""}`} onClick={() => setTab("schedule")}>Manager schedule</button>
         <button className={`lp-tab ${tab === "log" ? "is-active" : ""}`} onClick={() => setTab("log")}>Full log</button>
         <button className={`lp-tab ${tab === "sites" ? "is-active" : ""}`} onClick={() => setTab("sites")}>Sites &amp; people</button>
@@ -1165,6 +1169,25 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
       {tab === "assign" && <AssignTasksPanel workers={workers} assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
+      {tab === "myreport" && (
+        reportSaved ? (
+          <div className="lp-settings">
+            <p className="lp-saved"><Check size={13} /> Report submitted — it's in the Morning brief now.</p>
+            <button className="lp-btn-ghost" onClick={() => setReportSaved(false)}><Plus size={15} /> Write another</button>
+          </div>
+        ) : (
+          <WorkerForm
+            embedded
+            requirePhotos={false}
+            presetName={currentManager?.name || ""}
+            workerNames={[...workers.map((w) => w.name), ...managers.map((m) => m.name)]}
+            assignedTasks={assignedTasks}
+            onAcknowledge={onAcknowledgeAssignedTask}
+            onBack={() => setTab("brief")}
+            onSubmitted={async (report, photos) => { await onAddReport(report, photos); setReportSaved(true); }}
+          />
+        )
+      )}
       {tab === "schedule" && <ManagerSchedulePanel managers={managers} currentManager={currentManager} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
       {tab === "sites" && <SitesPeoplePanel />}
