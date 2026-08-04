@@ -97,6 +97,13 @@ create policy sites_anon_all       on sites            for all to anon using (tr
 create policy people_anon_all      on people           for all to anon using (true) with check (true);
 create policy site_assignments_anon_all on site_assignments for all to anon using (true) with check (true);
 
+insert into sites (id, name) values
+  ('site-01','Site One'),   ('site-02','Site Two'),      ('site-03','Site Three'),   ('site-04','Site Four'),
+  ('site-05','Site Five'),  ('site-06','Site Six'),      ('site-07','Site Seven'),   ('site-08','Site Eight'),
+  ('site-09','Site Nine'),  ('site-10','Site Ten'),      ('site-11','Site Eleven'),  ('site-12','Site Twelve'),
+  ('site-13','Site Thirteen'),('site-14','Site Fourteen'),('site-15','Site Fifteen'),('site-16','Site Sixteen')
+on conflict (id) do nothing;
+
 -- Backfill people from the old app_settings PINs (safe to re-run).
 insert into people (id, name, role, pin)
 select lower(regexp_replace(k, '[^a-zA-Z0-9]+', '-', 'g')),
