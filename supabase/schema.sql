@@ -38,6 +38,43 @@ alter table assigned_tasks add column if not exists end_time   text;
 alter table assigned_tasks add column if not exists acknowledged_by jsonb default '[]'::jsonb;
 create index if not exists assigned_tasks_active_idx on assigned_tasks (active, date);
 
+create table if not exists sites (
+  id         text primary key,
+  name       text not null,
+  address    text,
+  notes      text,
+  active     boolean default true,
+  created_at timestamptz default now()
+);
+
+-- Managers, staff and contractors. Replaces the hardcoded names and the
+-- staff_pins blob in app_settings.
+create table if not exists people (
+  id         text primary key,
+  name       text not null,
+  role       text not null default 'staff', -- manager | staff | contractor
+  pin        text,
+  active     boolean default true,
+  sort_order integer default 100, -- display order on the home screen
+  created_at timestamptz default now()
+);
+alter table people add column if not exists sort_order integer default 100;
+
+-- Which sites a person can see.
+create table if not exists site_assignments (
+  person_id  text not null references people (id) on delete cascade,
+  site_id    text not null references sites (id) on delete cascade,
+  created_at timestamptz default now(),
+  primary key (person_id, site_id)
+);
+
+alter table reports        add column if not exists site_id text references sites (id);
+alter table assigned_tasks add column if not exists site_id text references sites (id);
+
+create index if not exists reports_site_id_idx          on reports (site_id);
+create index if not exists assigned_tasks_site_id_idx   on assigned_tasks (site_id);
+create index if not exists site_assignments_site_id_idx on site_assignments (site_id);
+
 create table if not exists app_settings (
   id          integer primary key,
   manager_pin text,
@@ -51,7 +88,33 @@ on conflict (id) do nothing;
 alter table reports        enable row level security;
 alter table assigned_tasks enable row level security;
 alter table app_settings   enable row level security;
+alter table sites            enable row level security;
+alter table people           enable row level security;
+alter table site_assignments enable row level security;
 
 create policy reports_anon        on reports        for all to anon using (true) with check (true);
 create policy assigned_anon       on assigned_tasks for all to anon using (true) with check (true);
 create policy app_settings_anon   on app_settings   for all to anon using (true) with check (true);
+create policy sites_anon_all       on sites            for all to anon using (true) with check (true);
+create policy people_anon_all      on people           for all to anon using (true) with check (true);
+create policy site_assignments_anon_all on site_assignments for all to anon using (true) with check (true);
+
+insert into sites (id, name) values
+  ('site-01','Site One'),   ('site-02','Site Two'),      ('site-03','Site Three'),   ('site-04','Site Four'),
+  ('site-05','Site Five'),  ('site-06','Site Six'),      ('site-07','Site Seven'),   ('site-08','Site Eight'),
+  ('site-09','Site Nine'),  ('site-10','Site Ten'),      ('site-11','Site Eleven'),  ('site-12','Site Twelve'),
+  ('site-13','Site Thirteen'),('site-14','Site Fourteen'),('site-15','Site Fifteen'),('site-16','Site Sixteen')
+on conflict (id) do nothing;
+
+-- Backfill people from the old app_settings PINs (safe to re-run).
+insert into people (id, name, role, pin)
+select lower(regexp_replace(k, '[^a-zA-Z0-9]+', '-', 'g')),
+       k,
+       case when k ilike 'contractor%' then 'contractor' else 'staff' end,
+       v
+from app_settings, lateral jsonb_each_text(staff_pins) as e (k, v)
+on conflict (id) do nothing;
+
+insert into people (id, name, role, pin)
+select 'manager-1', 'Manager', 'manager', manager_pin from app_settings
+on conflict (id) do nothing;
