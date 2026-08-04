@@ -450,6 +450,76 @@ function nextStaffId(role, people) {
   return `${prefix}${String(highest + 1).padStart(2, "0")}`;
 }
 
+/* ---------------- Live tasks ---------------- */
+// Status vocabulary the database enforces; the UI only exposes these labels.
+const TASK_STATUSES = [
+  { value: "todo", label: "Pending" },
+  { value: "in_progress", label: "In progress" },
+  { value: "blocked", label: "Blocked" },
+  { value: "done", label: "Complete" },
+  { value: "cancelled", label: "Cancelled" },
+];
+const STAFF_TASK_STATUSES = ["todo", "in_progress", "done"];
+const TASK_PRIORITIES = ["low", "normal", "high", "urgent"];
+
+function taskStatusLabel(value) {
+  return TASK_STATUSES.find((s) => s.value === value)?.label || value;
+}
+
+function titleCase(word) {
+  return word ? word[0].toUpperCase() + word.slice(1) : word;
+}
+
+async function loadTasks(fromISO, toISO) {
+  try {
+    const rows = await supabaseFetch(
+      `/tasks?active=eq.true&date=gte.${fromISO}&date=lte.${toISO}&select=*,task_assignees(person_id,acknowledged_at)&order=date,scheduled_start`
+    );
+    return rows || [];
+  } catch { return []; }
+}
+
+async function createTask(task, assigneeIds) {
+  await supabaseFetch("/tasks", { method: "POST", body: [task] });
+  await setTaskAssignees(task.id, assigneeIds);
+}
+
+async function updateTask(taskId, patch) {
+  await supabaseFetch(`/tasks?id=eq.${taskId}`, {
+    method: "PATCH",
+    body: { ...patch, updated_at: new Date().toISOString() },
+  });
+}
+
+// Replaces the whole assignee list, mirroring savePersonSites.
+async function setTaskAssignees(taskId, personIds) {
+  await supabaseFetch(`/task_assignees?task_id=eq.${taskId}`, { method: "DELETE" });
+  if (!personIds.length) return;
+  await supabaseFetch("/task_assignees", {
+    method: "POST",
+    body: personIds.map((personId) => ({ task_id: taskId, person_id: personId })),
+  });
+}
+
+// Status changes carry their own timestamps, so "started 40 minutes ago" and
+// "finished at 2pm" survive later edits to the task itself.
+function statusPatch(status, { note, personId } = {}) {
+  const now = new Date().toISOString();
+  const patch = { status, status_changed_at: now };
+  if (personId) patch.updated_by = personId;
+  if (status === "in_progress") patch.actual_start = now;
+  if (status === "done") {
+    patch.actual_end = now;
+    patch.completion_note = note?.trim() || null;
+  }
+  if (status === "todo") { patch.actual_start = null; patch.actual_end = null; patch.completion_note = null; }
+  return patch;
+}
+
+async function deleteTask(taskId) {
+  await updateTask(taskId, { active: false });
+}
+
 async function loadManagerSchedule(ownerId) {
   try {
     const rows = await supabaseFetch(`/manager_schedule?owner_id=eq.${ownerId}&active=eq.true&select=*&order=date,start_time`);
@@ -659,6 +729,7 @@ export default function App() {
       ) : view === "form" ? (
         <WorkerForm
           presetName={presetName}
+          worker={workers.find((w) => w.name === presetName && w.role !== "manager") || null}
           workerNames={workers.map((w) => w.name)}
           assignedTasks={assignedTasks}
           onAcknowledge={acknowledgeAssignedTask}
@@ -765,8 +836,117 @@ function Home({ workers, managers, onWorker, onManager }) {
   );
 }
 
+function StaffTasksPanel({ person }) {
+  const [date, setDate] = useState(todayISO());
+  const [tasks, setTasks] = useState([]);
+  const [sites, setSites] = useState([]);
+  const [siteIds, setSiteIds] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const [completing, setCompleting] = useState(null);
+  const [note, setNote] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const [t, s, a] = await Promise.all([loadTasks(date, date), loadAllSites(), loadSiteAssignments()]);
+      setTasks(t); setSites(s);
+      setSiteIds(a.filter((x) => x.person_id === person.id).map((x) => x.site_id));
+      setLoading(false);
+    })();
+  }, [date, person.id]);
+
+  async function setStatus(task, status, completionNote) {
+    setBusy(task.id); setErr("");
+    try {
+      await updateTask(task.id, statusPatch(status, { note: completionNote, personId: person.id }));
+      setTasks(await loadTasks(date, date));
+      setCompleting(null); setNote("");
+    } catch (e) {
+      setErr(e.message || "Couldn't update that task — check your connection.");
+    }
+    setBusy("");
+  }
+
+  const siteName = (id) => sites.find((s) => s.id === id)?.name || id;
+
+  // Only this person's sites, and only tasks either assigned to them or left
+  // open for anyone on that site.
+  const mine = tasks.filter((t) => {
+    if (!siteIds.includes(t.site_id)) return false;
+    const assignees = (t.task_assignees || []).map((a) => a.person_id);
+    return assignees.length === 0 || assignees.includes(person.id);
+  });
+
+  return (
+    <div className="lp-panel lp-my-tasks">
+      <div className="lp-assigned-day-head">
+        <h4><ClipboardList size={15} /> My tasks</h4>
+        <input type="date" className="lp-input lp-input--slim" value={date} onChange={(e) => setDate(e.target.value)} />
+      </div>
+
+      {err && <p className="lp-error">{err}</p>}
+
+      {loading ? (
+        <p className="lp-hint">Loading…</p>
+      ) : !siteIds.length ? (
+        <EmptyState compact icon={<Building2 size={16} />} text="You're not assigned to a site yet — ask your manager." />
+      ) : mine.length === 0 ? (
+        <EmptyState compact icon={<Check size={16} />} text="Nothing scheduled for you on this day." />
+      ) : (
+        <ul className="lp-assigned-list">
+          {mine.map((task) => (
+            <li className={`lp-task-card is-${task.status}`} key={task.id}>
+              <div className="lp-task-card-head">
+                <strong>{task.title}</strong>
+                <span className={`lp-tag lp-status-${task.status}`}>{taskStatusLabel(task.status)}</span>
+              </div>
+              <span className="lp-worker-type">
+                {[siteName(task.site_id),
+                  task.scheduled_start && task.scheduled_end ? `${fmtTime12(task.scheduled_start)}–${fmtTime12(task.scheduled_end)}` : ""]
+                  .filter(Boolean).join(" · ")}
+              </span>
+              {task.details && <p className="lp-hint">{task.details}</p>}
+
+              {completing === task.id ? (
+                <>
+                  <Field label="Anything worth noting? (optional)">
+                    <textarea className="lp-textarea" rows={2} value={note} placeholder="e.g. Needed a new washer, replaced from the ute"
+                      onChange={(e) => setNote(e.target.value)} />
+                  </Field>
+                  <div className="lp-person-actions">
+                    <button className="lp-btn-ghost" disabled={busy === task.id} onClick={() => setStatus(task, "done", note)}>
+                      <Check size={13} /> {busy === task.id ? "Saving…" : "Mark complete"}
+                    </button>
+                    <button className="lp-btn-ghost" onClick={() => { setCompleting(null); setNote(""); }}><X size={13} /> Cancel</button>
+                  </div>
+                </>
+              ) : (
+                <div className="lp-status-row">
+                  {STAFF_TASK_STATUSES.map((value) => (
+                    <button type="button" key={value} disabled={busy === task.id}
+                      className={`lp-status-btn ${task.status === value ? "is-on" : ""}`}
+                      onClick={() => {
+                        if (value === "done") { setCompleting(task.id); setNote(task.completion_note || ""); }
+                        else setStatus(task, value);
+                      }}>
+                      {taskStatusLabel(value)}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {task.completion_note && completing !== task.id && <p className="lp-hint">Your note: {task.completion_note}</p>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /* ---------------- Worker Form ---------------- */
-function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, embedded = false, requirePhotos = true }) {
+function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, worker = null, embedded = false, requirePhotos = true }) {
   const [workerType, setWorkerType] = useState("");
   const [workerName, setWorkerName] = useState(presetName || "");
   const nameLocked = Boolean(presetName);
@@ -905,6 +1085,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
     <div className={embedded ? "" : "lp-page"}>
       {!embedded && <TopBar title="Daily Work Report" onBack={onBack} />}
       <div className="lp-form">
+        {worker && <StaffTasksPanel person={worker} />}
         <Section n="1" title="About today">
           <Field label="Worker type"><ChoiceRow options={["Full-time Employee", "Subcontractor"]} value={workerType} onChange={setWorkerType} /></Field>
           <Field label="Your name">
@@ -1213,6 +1394,7 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
       <TopBar title="Manager dashboard" onBack={onExit} right={<button className="lp-signout" onClick={onExit}><LogOut size={15} /> Sign out</button>} />
       <div className="lp-tabs">
         <button className={`lp-tab ${tab === "brief" ? "is-active" : ""}`} onClick={() => setTab("brief")}>Morning brief</button>
+        <button className={`lp-tab ${tab === "tasks" ? "is-active" : ""}`} onClick={() => setTab("tasks")}>Tasks</button>
         <button className={`lp-tab ${tab === "assign" ? "is-active" : ""}`} onClick={() => setTab("assign")}>Assign tasks</button>
         <button className={`lp-tab ${tab === "myreport" ? "is-active" : ""}`} onClick={() => { setReportSaved(false); setTab("myreport"); }}>Daily Work Report</button>
         <button className={`lp-tab ${tab === "schedule" ? "is-active" : ""}`} onClick={() => setTab("schedule")}>Manager schedule</button>
@@ -1221,6 +1403,7 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
+      {tab === "tasks" && <TasksPanel currentManager={currentManager} />}
       {tab === "assign" && <AssignTasksPanel workers={workers} assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
       {tab === "myreport" && (
         reportSaved ? (
@@ -1723,6 +1906,277 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate, workers })
           })
         )}
         <p className="lp-hint">{upcoming.length} task(s) assigned in total — use the calendar above to see any other day.</p>
+      </div>
+    </div>
+  );
+}
+
+function TasksPanel({ currentManager }) {
+  const [calMonth, setCalMonth] = useState(monthOf(todayISO()));
+  const [selectedDay, setSelectedDay] = useState(todayISO());
+  const [tasks, setTasks] = useState([]);
+  const [sites, setSites] = useState([]);
+  const [people, setPeople] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const emptyDraft = () => ({
+    siteId: "", date: selectedDay, title: "", details: "",
+    priority: "normal", start: "", end: "", assignees: [],
+  });
+  const [draft, setDraft] = useState(emptyDraft);
+
+  // A month either side of the one on screen, so paging the calendar doesn't
+  // blank out while it refetches.
+  async function refresh(month = calMonth) {
+    const from = `${addMonths(month, -1)}-01`;
+    const to = `${addMonths(month, 2)}-01`;
+    setTasks(await loadTasks(from, to));
+  }
+
+  useEffect(() => {
+    (async () => {
+      const [t, s, p] = await Promise.all([
+        loadTasks(`${addMonths(calMonth, -1)}-01`, `${addMonths(calMonth, 2)}-01`),
+        loadAllSites(),
+        loadAllPeople(),
+      ]);
+      setTasks(t); setSites(s.filter((x) => x.active)); setPeople(p.filter((x) => x.active && x.role !== "manager"));
+      setLoading(false);
+    })();
+  }, [calMonth]);
+
+  async function run(fn, fallbackMessage) {
+    setBusy(true); setErr("");
+    try { await fn(); await refresh(); return true; }
+    catch (e) { setErr(e.message || fallbackMessage); return false; }
+    finally { setBusy(false); }
+  }
+
+  function validate() {
+    if (!draft.siteId) return "Pick a site.";
+    if (!draft.title.trim()) return "Give the task a title.";
+    if (Boolean(draft.start) !== Boolean(draft.end)) return "Enter both a start and a finish time, or leave both blank.";
+    return "";
+  }
+
+  function taskBody() {
+    return {
+      site_id: draft.siteId,
+      date: draft.date,
+      title: draft.title.trim(),
+      details: draft.details.trim() || null,
+      priority: draft.priority,
+      scheduled_start: draft.start || null,
+      scheduled_end: draft.end || null,
+    };
+  }
+
+  async function saveNew() {
+    const problem = validate();
+    if (problem) { setErr(problem); return; }
+    const id = uid();
+    const ok = await run(() => createTask({
+      id, ...taskBody(), status: "todo", created_by: currentManager?.id || null, updated_by: currentManager?.id || null,
+    }, draft.assignees), "Couldn't create that task — try again.");
+    if (ok) { setAdding(false); setDraft(emptyDraft()); }
+  }
+
+  async function saveEdit(taskId) {
+    const problem = validate();
+    if (problem) { setErr(problem); return; }
+    const ok = await run(async () => {
+      await updateTask(taskId, { ...taskBody(), updated_by: currentManager?.id || null });
+      await setTaskAssignees(taskId, draft.assignees);
+    }, "Couldn't save that task — try again.");
+    if (ok) setEditing(null);
+  }
+
+  function startEdit(task) {
+    setErr("");
+    setAdding(false);
+    setEditing(task.id);
+    setDraft({
+      siteId: task.site_id, date: task.date, title: task.title, details: task.details || "",
+      priority: task.priority, start: task.scheduled_start || "", end: task.scheduled_end || "",
+      assignees: (task.task_assignees || []).map((a) => a.person_id),
+    });
+  }
+
+  function toggleAssignee(personId) {
+    setDraft((d) => ({
+      ...d,
+      assignees: d.assignees.includes(personId)
+        ? d.assignees.filter((p) => p !== personId)
+        : [...d.assignees, personId],
+    }));
+  }
+
+  const siteName = (id) => sites.find((s) => s.id === id)?.name || id;
+  const personName = (id) => people.find((p) => p.id === id)?.name || id;
+
+  const byDate = new Map();
+  tasks.forEach((t) => {
+    if (!byDate.has(t.date)) byDate.set(t.date, []);
+    byDate.get(t.date).push(t);
+  });
+  const dayTasks = byDate.get(selectedDay) || [];
+  const openCount = dayTasks.filter((t) => t.status !== "done" && t.status !== "cancelled").length;
+
+  if (loading) return <div className="lp-settings"><p className="lp-hint">Loading tasks…</p></div>;
+
+  const form = (
+    <>
+      <div className="lp-row2">
+        <Field label="Site">
+          <select className="lp-input" value={draft.siteId} onChange={(e) => setDraft((d) => ({ ...d, siteId: e.target.value }))}>
+            <option value="">Choose a site…</option>
+            {sites.map((s) => <option value={s.id} key={s.id}>{s.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Date">
+          <input type="date" className="lp-input" value={draft.date} onChange={(e) => setDraft((d) => ({ ...d, date: e.target.value }))} />
+        </Field>
+      </div>
+      <Field label="Task">
+        <input className="lp-input" value={draft.title} placeholder="e.g. Clear the blocked gutter on the east wing"
+          onChange={(e) => setDraft((d) => ({ ...d, title: e.target.value }))} />
+      </Field>
+      <Field label="Detail (optional)">
+        <textarea className="lp-textarea" rows={2} value={draft.details} placeholder="Anything the crew needs to know"
+          onChange={(e) => setDraft((d) => ({ ...d, details: e.target.value }))} />
+      </Field>
+      <div className="lp-row2">
+        <Field label="Expected start (optional)">
+          <input type="time" className="lp-input" value={draft.start} onChange={(e) => setDraft((d) => ({ ...d, start: e.target.value }))} />
+        </Field>
+        <Field label="Expected finish (optional)">
+          <input type="time" className="lp-input" value={draft.end} onChange={(e) => setDraft((d) => ({ ...d, end: e.target.value }))} />
+        </Field>
+      </div>
+      <Field label="Priority">
+        <ChoiceRow options={TASK_PRIORITIES.map(titleCase)} value={titleCase(draft.priority)}
+          onChange={(v) => setDraft((d) => ({ ...d, priority: v.toLowerCase() }))} />
+      </Field>
+      <Field label="Assign to (leave empty for anyone on that site)">
+        <div className="lp-checkbox-grid">
+          {people.map((person) => (
+            <label className="lp-checkbox-chip" key={person.id}>
+              <input type="checkbox" checked={draft.assignees.includes(person.id)} onChange={() => toggleAssignee(person.id)} />
+              <span>{person.name}</span>
+            </label>
+          ))}
+        </div>
+      </Field>
+    </>
+  );
+
+  return (
+    <div className="lp-assign">
+      <div className="lp-panel">
+        <div className="lp-cal-head">
+          <button type="button" className="lp-btn-ghost" aria-label="Previous month" onClick={() => setCalMonth((m) => addMonths(m, -1))}><ChevronLeft size={15} /></button>
+          <h4>{fmtMonthLong(calMonth)}</h4>
+          <button type="button" className="lp-btn-ghost" aria-label="Next month" onClick={() => setCalMonth((m) => addMonths(m, 1))}><ChevronRight size={15} /></button>
+          <button type="button" className="lp-btn-ghost" onClick={() => { setCalMonth(monthOf(todayISO())); setSelectedDay(todayISO()); }}>Today</button>
+        </div>
+        <div className="lp-cal-weekdays">
+          {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => <span key={d}>{d}</span>)}
+        </div>
+        <div className="lp-cal-grid">
+          {monthGridDays(calMonth).map((iso, i) => {
+            if (!iso) return <span className="lp-cal-cell is-empty" key={`e${i}`} />;
+            const count = (byDate.get(iso) || []).length;
+            const classes = ["lp-cal-cell", count > 0 ? "has-tasks" : "", iso === selectedDay ? "is-selected" : "", iso === todayISO() ? "is-today" : ""].join(" ");
+            return (
+              <button type="button" className={classes} key={iso} onClick={() => setSelectedDay(iso)}>
+                <span className="lp-cal-day">{Number(iso.slice(8, 10))}</span>
+                {count > 0 && <span className="lp-cal-count">{count}</span>}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="lp-panel">
+        <div className="lp-assigned-day-head">
+          <span className="lp-assigned-day-date"><CalendarDays size={13} /> {fmtDayHeading(selectedDay)}</span>
+          <span className="lp-hint">{dayTasks.length} task(s), {openCount} still open</span>
+        </div>
+
+        {err && <p className="lp-error">{err}</p>}
+
+        {adding ? (
+          <div className="lp-person-row">
+            {form}
+            <div className="lp-person-actions">
+              <button className="lp-btn-ghost" onClick={saveNew} disabled={busy}><Check size={13} /> {busy ? "Saving…" : "Create task"}</button>
+              <button className="lp-btn-ghost" onClick={() => { setAdding(false); setErr(""); }}><X size={13} /> Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <button className="lp-btn-ghost" onClick={() => { setAdding(true); setEditing(null); setErr(""); setDraft({ ...emptyDraft(), date: selectedDay }); }}>
+            <Plus size={15} /> Add a task for this day
+          </button>
+        )}
+
+        {dayTasks.length === 0 ? (
+          <EmptyState compact icon={<Check size={16} />} text="Nothing scheduled for this day." />
+        ) : (
+          <div className="lp-person-list">
+            {dayTasks.map((task) => (
+              <div className={`lp-person-row lp-task-row is-${task.status}`} key={task.id}>
+                {editing === task.id ? (
+                  <>
+                    {form}
+                    <div className="lp-person-actions">
+                      <button className="lp-btn-ghost" onClick={() => saveEdit(task.id)} disabled={busy}><Check size={13} /> {busy ? "Saving…" : "Save task"}</button>
+                      <button className="lp-btn-ghost" onClick={() => { setEditing(null); setErr(""); }}><X size={13} /> Cancel</button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="lp-person-head">
+                      <div>
+                        <strong>{task.title}</strong>
+                        <span className={`lp-tag lp-status-${task.status}`}>{taskStatusLabel(task.status)}</span>
+                        {task.priority !== "normal" && <span className="lp-tag">{titleCase(task.priority)}</span>}
+                        <span className="lp-worker-type">
+                          {[siteName(task.site_id),
+                            task.scheduled_start && task.scheduled_end ? `${fmtTime12(task.scheduled_start)}–${fmtTime12(task.scheduled_end)}` : "",
+                            (task.task_assignees || []).length
+                              ? (task.task_assignees || []).map((a) => personName(a.person_id)).join(", ")
+                              : "Anyone on site"].filter(Boolean).join(" · ")}
+                        </span>
+                      </div>
+                      <div className="lp-person-actions">
+                        <button className="lp-btn-ghost" onClick={() => startEdit(task)}><Settings size={13} /> Edit</button>
+                        <button className="lp-btn-ghost" disabled={busy}
+                          onClick={() => { if (window.confirm(`Delete "${task.title}"?`)) run(() => deleteTask(task.id), "Couldn't delete that task — try again."); }}>
+                          <Trash2 size={13} /> Delete
+                        </button>
+                      </div>
+                    </div>
+                    {task.details && <p className="lp-hint">{task.details}</p>}
+                    {task.completion_note && <p className="lp-hint">Note on completion: {task.completion_note}</p>}
+                    <div className="lp-status-row">
+                      {TASK_STATUSES.map((s) => (
+                        <button type="button" key={s.value} disabled={busy}
+                          className={`lp-status-btn ${task.status === s.value ? "is-on" : ""}`}
+                          onClick={() => run(() => updateTask(task.id, statusPatch(s.value, { personId: currentManager?.id })), "Couldn't change that status — try again.")}>
+                          {s.label}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="lp-hint lp-hint--muted">{taskStatusLabel(task.status)} since {fmtAckTime(task.status_changed_at)}</p>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2642,6 +3096,19 @@ body{margin:0;}
 .lp-site-option.is-on{border-color:var(--brass);background:var(--stone);}
 .lp-hint--muted{margin:8px 0 0;}
 .lp-person-row.is-inactive{opacity:.55;}
+.lp-task-row.is-done,.lp-task-card.is-done{opacity:.7;}
+.lp-status-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}
+.lp-status-btn{background:none;border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:12px;font-weight:600;color:var(--muted);cursor:pointer;}
+.lp-status-btn.is-on{border-color:var(--brass);background:var(--stone);color:var(--ink);}
+.lp-status-done{background:var(--stone);}
+.lp-status-blocked,.lp-status-cancelled{color:var(--muted);}
+.lp-my-tasks{margin-bottom:14px;}
+.lp-input--slim{width:auto;padding:6px 9px;font-size:12.5px;}
+.lp-task-card{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel);list-style:none;}
+.lp-task-card + .lp-task-card{margin-top:10px;}
+.lp-task-card-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.lp-task-card-head strong{font-family:'Fraunces',serif;font-size:14px;}
+.lp-task-card .lp-worker-type{display:block;margin:5px 0 2px;}
 .lp-subtabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:12px;}
 .lp-subtabs .lp-tab{display:flex;align-items:center;gap:6px;padding:8px 12px;}
 
