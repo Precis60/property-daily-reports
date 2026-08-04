@@ -210,6 +210,7 @@ function rowToReport(row) {
     hours: Number(row.hours) || 0, tasks: row.tasks || [], photoCount: row.photo_count || 0,
     delays: row.delays || "No", delayExplain: row.delay_explain || "", delayNotes: row.delay_notes || "",
     tomorrow: row.tomorrow || "", fullCheck: row.full_check || "", confirmed: true,
+    siteId: row.site_id || "",
     submittedAt: row.submitted_at || "",
   };
 }
@@ -219,7 +220,7 @@ function reportToRow(report, photos) {
     arrival: report.arrival, departure: report.departure, hours: report.hours, tasks: report.tasks,
     photo_count: report.photoCount, delays: report.delays, delay_explain: report.delayExplain,
     delay_notes: report.delayNotes, tomorrow: report.tomorrow, full_check: report.fullCheck,
-    submitted_at: report.submittedAt, photos: photos || [],
+    submitted_at: report.submittedAt, site_id: report.siteId || null, photos: photos || [],
   };
 }
 
@@ -949,6 +950,8 @@ function StaffTasksPanel({ person }) {
 function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, worker = null, embedded = false, requirePhotos = true }) {
   const [workerType, setWorkerType] = useState("");
   const [workerName, setWorkerName] = useState(presetName || "");
+  const [siteId, setSiteId] = useState("");
+  const [siteOptions, setSiteOptions] = useState([]);
   const nameLocked = Boolean(presetName);
   const [date, setDate] = useState(todayISO());
   const [arrival, setArrival] = useState("");
@@ -968,6 +971,23 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  // A worker picks from the sites they're assigned to; managers filing their
+  // own report, and anyone with no assignments yet, get the full list rather
+  // than being locked out of reporting.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [sites, assignments] = await Promise.all([loadAllSites(), loadSiteAssignments()]);
+      if (cancelled) return;
+      const active = sites.filter((s) => s.active);
+      const mine = worker ? assignments.filter((a) => a.person_id === worker.id).map((a) => a.site_id) : [];
+      const options = mine.length ? active.filter((s) => mine.includes(s.id)) : active;
+      setSiteOptions(options);
+      if (options.length === 1) setSiteId(options[0].id);
+    })();
+    return () => { cancelled = true; };
+  }, [worker]);
 
   const relevantAssigned = (assignedTasks || []).filter((t) => {
     if (t.date !== date) return false;
@@ -1029,6 +1049,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
   function validate() {
     if (!workerType) return "Select whether you're a full-time employee or subcontractor.";
     if (!workerName.trim()) return "Enter your name.";
+    if (!siteId) return "Choose the site you worked on.";
     if (!date) return "Enter today's date.";
     if (!arrival || !departure) return "Enter arrival and departure time.";
     if (!taskCountChoice) return "Select how many tasks you completed.";
@@ -1057,7 +1078,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
     setError("");
     setSubmitting(true);
     const report = {
-      id: uid(), workerType, workerName: workerName.trim(), date, arrival, departure,
+      id: uid(), workerType, workerName: workerName.trim(), siteId, date, arrival, departure,
       hours: hoursBetween(arrival, departure),
       tasks: tasks.map((t) => ({
         ...t,
@@ -1093,6 +1114,16 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
               <div className="lp-locked-name"><Lock size={13} /> {workerName}</div>
             ) : (
               <input className="lp-input" value={workerName} onChange={(e) => setWorkerName(e.target.value)} placeholder="Full name" />
+            )}
+          </Field>
+          <Field label="Site">
+            {siteOptions.length === 1 ? (
+              <div className="lp-locked-name"><Building2 size={13} /> {siteOptions[0].name}</div>
+            ) : (
+              <select className="lp-input" value={siteId} onChange={(e) => setSiteId(e.target.value)}>
+                <option value="">Choose the site…</option>
+                {siteOptions.map((s) => <option value={s.id} key={s.id}>{s.name}</option>)}
+              </select>
             )}
           </Field>
           <div className="lp-row3">
@@ -2182,11 +2213,42 @@ function TasksPanel({ currentManager }) {
   );
 }
 
+// Sites for the manager filters. Includes inactive ones so old reports still
+// show a name rather than a bare id.
+function useSites() {
+  const [sites, setSites] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    loadAllSites().then((rows) => { if (!cancelled) setSites(rows); });
+    return () => { cancelled = true; };
+  }, []);
+  return sites;
+}
+
+function SiteFilter({ sites, value, onChange }) {
+  return (
+    <select className="lp-input lp-datebar-input" value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="">All sites</option>
+      {sites.map((s) => <option value={s.id} key={s.id}>{s.name}</option>)}
+      <option value="none">No site recorded</option>
+    </select>
+  );
+}
+
+// "" means every site; "none" means the reports filed before sites existed.
+function matchesSite(report, filter) {
+  if (!filter) return true;
+  if (filter === "none") return !report.siteId;
+  return report.siteId === filter;
+}
+
 function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
   const [selectedDate, setSelectedDate] = useState(todayISO());
   const [rangeReports, setRangeReports] = useState([]);
   const [outstandingReports, setOutstandingReports] = useState([]);
   const [busy, setBusy] = useState(true);
+  const [siteFilter, setSiteFilter] = useState("");
+  const sites = useSites();
 
   const weekStart = startOfWeek(selectedDate);
 
@@ -2206,8 +2268,8 @@ function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
     return () => { cancelled = true; };
   }, [selectedDate, cacheVersion]);
 
-  const todays = rangeReports.filter((r) => r.date === selectedDate);
-  const weekReports = rangeReports.filter((r) => r.date >= weekStart && r.date <= selectedDate);
+  const todays = rangeReports.filter((r) => r.date === selectedDate && matchesSite(r, siteFilter));
+  const weekReports = rangeReports.filter((r) => r.date >= weekStart && r.date <= selectedDate && matchesSite(r, siteFilter));
 
   const byWorker = {};
   todays.forEach((r) => {
@@ -2223,7 +2285,7 @@ function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
   });
 
   const outstanding = [];
-  outstandingReports.forEach((r) => {
+  outstandingReports.filter((r) => matchesSite(r, siteFilter)).forEach((r) => {
     r.tasks.forEach((t) => { if (t.status !== "Complete") outstanding.push({ ...t, date: r.date, worker: r.workerName || r.workerType }); });
   });
   outstanding.sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -2241,6 +2303,7 @@ function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
         <button className="lp-nav-btn" onClick={() => setSelectedDate(addDays(selectedDate, 1))} aria-label="Next day"><ChevronRight size={16} /></button>
         <button className="lp-btn-ghost lp-today-btn" onClick={() => setSelectedDate(todayISO())}>Today</button>
         <button className="lp-btn-ghost" onClick={() => refreshMonths(monthsBetween(weekStart, selectedDate))}>Refresh</button>
+        <SiteFilter sites={sites} value={siteFilter} onChange={setSiteFilter} />
       </div>
 
       <div className="lp-brief-header">
@@ -2250,7 +2313,7 @@ function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
       {busy ? (
         <EmptyState icon={<ClipboardList size={22} />} text="Loading…" />
       ) : workerKeys.length === 0 ? (
-        <EmptyState icon={<ClipboardList size={22} />} text="No reports submitted for this date yet." />
+        <EmptyState icon={<ClipboardList size={22} />} text={siteFilter ? "No reports for this site on this date." : "No reports submitted for this date yet."} />
       ) : (
         <>
           <div className="lp-worker-cards">
@@ -2346,6 +2409,8 @@ function FullLog({ monthsIndex, getMonths, cacheVersion, onDeleteReport }) {
   const [busy, setBusy] = useState(true);
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState(null);
+  const [siteFilter, setSiteFilter] = useState("");
+  const sites = useSites();
 
   useEffect(() => {
     let cancelled = false;
@@ -2358,6 +2423,7 @@ function FullLog({ monthsIndex, getMonths, cacheVersion, onDeleteReport }) {
 
   const sorted = [...monthReports].sort((a, b) => (a.date < b.date ? 1 : -1) || (a.submittedAt < b.submittedAt ? 1 : -1));
   const filtered = sorted.filter((r) => {
+    if (!matchesSite(r, siteFilter)) return false;
     const q = query.toLowerCase();
     if (!q) return true;
     return (r.workerName || "").toLowerCase().includes(q) || r.date.includes(q) ||
@@ -2373,6 +2439,7 @@ function FullLog({ monthsIndex, getMonths, cacheVersion, onDeleteReport }) {
         </select>
         <button className="lp-nav-btn" onClick={() => setSelectedYm(addMonths(selectedYm, 1))} aria-label="Next month"><ChevronRight size={16} /></button>
         <button className="lp-btn-ghost lp-today-btn" onClick={() => setSelectedYm(monthOf(todayISO()))}>This month</button>
+        <SiteFilter sites={sites} value={siteFilter} onChange={setSiteFilter} />
       </div>
 
       <div className="lp-log-search">
@@ -2387,7 +2454,7 @@ function FullLog({ monthsIndex, getMonths, cacheVersion, onDeleteReport }) {
       ) : (
         <div className="lp-log-list">
           {filtered.map((r) => (
-            <LogEntry key={r.id} report={r} open={expanded === r.id} onToggle={() => setExpanded(expanded === r.id ? null : r.id)} onDelete={onDeleteReport} />
+            <LogEntry key={r.id} report={r} siteName={sites.find((x) => x.id === r.siteId)?.name || ""} open={expanded === r.id} onToggle={() => setExpanded(expanded === r.id ? null : r.id)} onDelete={onDeleteReport} />
           ))}
         </div>
       )}
@@ -2395,7 +2462,7 @@ function FullLog({ monthsIndex, getMonths, cacheVersion, onDeleteReport }) {
   );
 }
 
-function LogEntry({ report, open, onToggle, onDelete }) {
+function LogEntry({ report, siteName = "", open, onToggle, onDelete }) {
   const [photos, setPhotos] = useState(null);
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -2417,6 +2484,7 @@ function LogEntry({ report, open, onToggle, onDelete }) {
         <div className="lp-log-entry-main">
           <strong>{report.workerName}</strong>
           <span className="lp-tag">{report.workerType}</span>
+          {siteName && <span className="lp-tag">{siteName}</span>}
           {report.delays === "Yes" && <span className="lp-tag lp-tag--warn"><AlertTriangle size={11} /> Delay</span>}
           {report.fullCheck === "No" && <span className="lp-tag lp-tag--warn"><AlertTriangle size={11} /> No end-of-day check</span>}
         </div>
