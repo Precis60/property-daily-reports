@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   Check, X, AlertTriangle, Clock, Camera, Lock, ChevronRight,
   ChevronDown, ChevronLeft, Plus, Trash2, ArrowLeft, Sun, ClipboardList, Settings,
-  CalendarDays, ImageOff, ShieldCheck, LogOut, Search
+  CalendarDays, ImageOff, ShieldCheck, LogOut, Search, Building2, Users
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -367,6 +367,43 @@ function expectedWindowLabel(task) {
   if (!task.startTime || !task.endTime) return "";
   return `${fmtTime12(task.startTime)}\u2013${fmtTime12(task.endTime)}`;
 }
+async function loadSites() {
+  try {
+    const rows = await supabaseFetch("/sites?active=eq.true&select=id,name,address&order=id");
+    return rows || [];
+  } catch { return []; }
+}
+
+async function loadPeople() {
+  try {
+    const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role&order=name");
+    return rows || [];
+  } catch { return []; }
+}
+
+async function loadSiteAssignments() {
+  try {
+    const rows = await supabaseFetch("/site_assignments?select=person_id,site_id");
+    return rows || [];
+  } catch { return []; }
+}
+
+// Replaces a person's whole site list in one go.
+async function savePersonSites(personId, siteIds) {
+  await supabaseFetch(`/site_assignments?person_id=eq.${personId}`, { method: "DELETE" });
+  if (!siteIds.length) return;
+  await supabaseFetch("/site_assignments", {
+    method: "POST",
+    body: siteIds.map((siteId) => ({ person_id: personId, site_id: siteId })),
+  });
+}
+
+function roleLabel(role) {
+  if (role === "manager") return "Manager";
+  if (role === "contractor") return "Contractor";
+  return "Staff";
+}
+
 async function deleteReportInSupabase(id) {
   await supabaseFetch(`/reports?id=eq.${id}`, { method: "DELETE" });
 }
@@ -1043,11 +1080,13 @@ function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion,
         <button className={`lp-tab ${tab === "brief" ? "is-active" : ""}`} onClick={() => setTab("brief")}>Morning brief</button>
         <button className={`lp-tab ${tab === "assign" ? "is-active" : ""}`} onClick={() => setTab("assign")}>Assign tasks</button>
         <button className={`lp-tab ${tab === "log" ? "is-active" : ""}`} onClick={() => setTab("log")}>Full log</button>
+        <button className={`lp-tab ${tab === "sites" ? "is-active" : ""}`} onClick={() => setTab("sites")}>Sites &amp; people</button>
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
       {tab === "assign" && <AssignTasksPanel assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
+      {tab === "sites" && <SitesPeoplePanel />}
       {tab === "settings" && <ManagerSettings settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
     </div>
   );
@@ -1646,6 +1685,127 @@ function LogEntry({ report, open, onToggle, onDelete }) {
   );
 }
 
+/* ---------------- Sites & people ---------------- */
+function SitesPeoplePanel() {
+  const [sites, setSites] = useState([]);
+  const [people, setPeople] = useState([]);
+  const [assignments, setAssignments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(null); // person id
+  const [draft, setDraft] = useState([]);       // site ids being edited
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const [s, p, a] = await Promise.all([loadSites(), loadPeople(), loadSiteAssignments()]);
+      setSites(s); setPeople(p); setAssignments(a); setLoading(false);
+    })();
+  }, []);
+
+  const sitesFor = (personId) =>
+    assignments.filter((a) => a.person_id === personId).map((a) => a.site_id);
+  const siteName = (id) => sites.find((s) => s.id === id)?.name || id;
+
+  function startEdit(person) {
+    setErr("");
+    setEditing(person.id);
+    setDraft(sitesFor(person.id));
+  }
+
+  function toggleSite(siteId) {
+    setDraft((d) => (d.includes(siteId) ? d.filter((s) => s !== siteId) : [...d, siteId]));
+  }
+
+  async function save(personId) {
+    setSaving(true); setErr("");
+    try {
+      await savePersonSites(personId, draft);
+      setAssignments(await loadSiteAssignments());
+      setEditing(null);
+    } catch (e) {
+      setErr(e.message || "Couldn't save those site assignments — try again.");
+    }
+    setSaving(false);
+  }
+
+  if (loading) return <div className="lp-settings"><p className="lp-hint">Loading sites and people…</p></div>;
+
+  const workers = people.filter((p) => p.role !== "manager");
+  const managers = people.filter((p) => p.role === "manager");
+
+  return (
+    <div className="lp-settings">
+      <h3><Building2 size={16} /> Sites</h3>
+      <p className="lp-hint">{sites.length} site{sites.length === 1 ? "" : "s"}. Names and addresses can be updated later.</p>
+      <div className="lp-site-chips">
+        {sites.map((s) => <span className="lp-tag" key={s.id}>{s.name}</span>)}
+      </div>
+
+      <hr className="lp-settings-divider" />
+
+      <h3><Users size={16} /> Site access</h3>
+      <p className="lp-hint">
+        Tick any combination of sites for each person. Managers see every site automatically.
+      </p>
+      {err && <p className="lp-error">{err}</p>}
+
+      <div className="lp-person-list">
+        {workers.map((person) => {
+          const current = sitesFor(person.id);
+          const isEditing = editing === person.id;
+          return (
+            <div className="lp-person-row" key={person.id}>
+              <div className="lp-person-head">
+                <div>
+                  <strong>{person.name}</strong>
+                  <span className="lp-worker-type">{roleLabel(person.role)}</span>
+                </div>
+                {!isEditing && (
+                  <button className="lp-btn-ghost" onClick={() => startEdit(person)}>
+                    Edit sites
+                  </button>
+                )}
+              </div>
+
+              {isEditing ? (
+                <>
+                  <div className="lp-site-picker">
+                    {sites.map((s) => (
+                      <label className={`lp-site-option ${draft.includes(s.id) ? "is-on" : ""}`} key={s.id}>
+                        <input type="checkbox" checked={draft.includes(s.id)} onChange={() => toggleSite(s.id)} />
+                        <span>{s.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <div className="lp-person-actions">
+                    <button className="lp-btn-ghost" onClick={() => setDraft(sites.map((s) => s.id))}>All sites</button>
+                    <button className="lp-btn-ghost" onClick={() => setDraft([])}>None</button>
+                    <button className="lp-btn-ghost" onClick={() => save(person.id)} disabled={saving}>
+                      {saving ? "Saving…" : "Save"}
+                    </button>
+                    <button className="lp-btn-ghost" onClick={() => setEditing(null)}>Cancel</button>
+                  </div>
+                </>
+              ) : current.length ? (
+                <div className="lp-site-chips">
+                  {current.map((id) => <span className="lp-tag" key={id}>{siteName(id)}</span>)}
+                </div>
+              ) : (
+                <p className="lp-hint lp-hint--muted">No sites yet.</p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <p className="lp-hint lp-settings-note">
+        Managers with full access: {managers.map((m) => m.name).join(", ") || "none"}.
+      </p>
+    </div>
+  );
+}
+
 function ManagerSettings({ settings, onChange, onRestored }) {
   const [pin, setPin] = useState(settings.managerPin || DEFAULT_PIN);
   const [saved, setSaved] = useState(false);
@@ -1868,7 +2028,18 @@ body{margin:0;}
 .lp-pin-mask{-webkit-text-security:disc;text-security:disc;}
 .lp-gate-default{margin-top:14px;}
 
-.lp-tabs{display:flex;gap:6px;padding:12px 16px 0;border-bottom:1px solid var(--line);}
+.lp-site-chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;}
+.lp-person-list{display:flex;flex-direction:column;gap:10px;margin-top:10px;}
+.lp-person-row{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel);}
+.lp-person-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;}
+.lp-person-head strong{font-family:'Fraunces',serif;font-size:14px;margin-right:8px;}
+.lp-person-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;}
+.lp-site-picker{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px;margin-top:10px;}
+.lp-site-option{display:flex;align-items:center;gap:7px;font-size:12.5px;border:1px solid var(--line);border-radius:9px;padding:7px 9px;cursor:pointer;}
+.lp-site-option.is-on{border-color:var(--brass);background:var(--stone);}
+.lp-hint--muted{margin:8px 0 0;}
+
+.lp-tabs{display:flex;gap:6px;padding:12px 16px 0;border-bottom:1px solid var(--line);overflow-x:auto;}
 .lp-tab{background:none;border:none;padding:10px 14px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;}
 .lp-tab.is-active{color:var(--ink);border-color:var(--brass);}
 
