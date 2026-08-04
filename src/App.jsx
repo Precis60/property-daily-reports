@@ -400,7 +400,7 @@ async function loadAllSites() {
 
 async function loadAllPeople() {
   try {
-    const rows = await supabaseFetch("/people?select=id,name,role,pin,active,sort_order&order=sort_order,name");
+    const rows = await supabaseFetch("/people?select=id,name,role,pin,active,sort_order,phone,business_name,staff_id&order=sort_order,name");
     return rows || [];
   } catch { return []; }
 }
@@ -436,6 +436,18 @@ function personIdFrom(name, taken) {
   let n = 2;
   while (taken.includes(id)) { id = `${base}-${n}`; n += 1; }
   return id;
+}
+
+// STF-01 for staff, CON-01 for contractors; managers don't get one.
+function nextStaffId(role, people) {
+  if (role === "manager") return "";
+  const prefix = role === "contractor" ? "CON-" : "STF-";
+  const highest = people.reduce((max, p) => {
+    if (!p.staff_id || !String(p.staff_id).startsWith(prefix)) return max;
+    const n = parseInt(String(p.staff_id).slice(prefix.length), 10);
+    return Number.isNaN(n) ? max : Math.max(max, n);
+  }, 0);
+  return `${prefix}${String(highest + 1).padStart(2, "0")}`;
 }
 
 async function loadManagerSchedule(ownerId) {
@@ -2024,8 +2036,9 @@ function AdminPanel() {
   const [addingSite, setAddingSite] = useState(false);
 
   const [editingPerson, setEditingPerson] = useState(null);
-  const [personDraft, setPersonDraft] = useState({ name: "", role: "staff", pin: "" });
-  const [newPerson, setNewPerson] = useState({ name: "", role: "staff", pin: "" });
+  const emptyPerson = { name: "", role: "staff", pin: "", phone: "", businessName: "", staffId: "" };
+  const [personDraft, setPersonDraft] = useState(emptyPerson);
+  const [newPerson, setNewPerson] = useState(emptyPerson);
   const [addingPerson, setAddingPerson] = useState(false);
   const [editingSitesFor, setEditingSitesFor] = useState(null);
   const [siteDraftIds, setSiteDraftIds] = useState([]);
@@ -2077,15 +2090,20 @@ function AdminPanel() {
     if (!newPerson.name.trim()) { setErr("Enter a name."); return; }
     if (!/^\d{4}$/.test(newPerson.pin.trim())) { setErr("PINs are 4 digits."); return; }
     if (people.some((p) => p.active && p.pin === newPerson.pin.trim())) { setErr("That PIN is already in use."); return; }
+    const newStaffId = newPerson.staffId.trim() || nextStaffId(newPerson.role, people);
+    if (newStaffId && people.some((p) => p.staff_id === newStaffId)) { setErr("That staff ID is already in use."); return; }
     const ok = await run(() => createPerson({
       id: personIdFrom(newPerson.name, people.map((p) => p.id)),
       name: newPerson.name.trim(),
       role: newPerson.role,
       pin: newPerson.pin.trim(),
+      phone: newPerson.phone.trim() || null,
+      business_name: newPerson.businessName.trim() || null,
+      staff_id: newStaffId || null,
       active: true,
       sort_order: people.reduce((max, p) => Math.max(max, p.sort_order || 0), 0) + 1,
     }), "Couldn't add that person — try again.");
-    if (ok) { setNewPerson({ name: "", role: "staff", pin: "" }); setAddingPerson(false); }
+    if (ok) { setNewPerson(emptyPerson); setAddingPerson(false); }
   }
 
   async function savePerson(personId) {
@@ -2094,8 +2112,17 @@ function AdminPanel() {
     if (people.some((p) => p.active && p.id !== personId && p.pin === personDraft.pin.trim())) {
       setErr("That PIN is already in use."); return;
     }
+    const draftStaffId = personDraft.staffId.trim();
+    if (draftStaffId && people.some((p) => p.id !== personId && p.staff_id === draftStaffId)) {
+      setErr("That staff ID is already in use."); return;
+    }
     const ok = await run(() => updatePerson(personId, {
-      name: personDraft.name.trim(), role: personDraft.role, pin: personDraft.pin.trim(),
+      name: personDraft.name.trim(),
+      role: personDraft.role,
+      pin: personDraft.pin.trim(),
+      phone: personDraft.phone.trim() || null,
+      business_name: personDraft.businessName.trim() || null,
+      staff_id: draftStaffId || null,
     }), "Couldn't save that person — try again.");
     if (ok) setEditingPerson(null);
   }
@@ -2224,6 +2251,25 @@ function AdminPanel() {
                 <ChoiceRow options={["Staff", "Contractor", "Manager"]} value={roleLabel(newPerson.role)}
                   onChange={(v) => setNewPerson((d) => ({ ...d, role: v.toLowerCase() }))} />
               </Field>
+              {newPerson.role !== "manager" && (
+                <>
+                  <div className="lp-row2">
+                    <Field label="Phone">
+                      <input className="lp-input" value={newPerson.phone} inputMode="tel" placeholder="e.g. 0412 345 678"
+                        onChange={(e) => setNewPerson((d) => ({ ...d, phone: e.target.value }))} />
+                    </Field>
+                    <Field label="Business name">
+                      <input className="lp-input" value={newPerson.businessName} placeholder="Contractors only, if they trade under one"
+                        onChange={(e) => setNewPerson((d) => ({ ...d, businessName: e.target.value }))} />
+                    </Field>
+                  </div>
+                  <Field label="Staff ID">
+                    <input className="lp-input" value={newPerson.staffId} placeholder={nextStaffId(newPerson.role, people)}
+                      onChange={(e) => setNewPerson((d) => ({ ...d, staffId: e.target.value }))} />
+                  </Field>
+                  <p className="lp-hint">Leave the ID blank to use {nextStaffId(newPerson.role, people)}.</p>
+                </>
+              )}
               <div className="lp-person-actions">
                 <button className="lp-btn-ghost" onClick={addPerson} disabled={busy}><Check size={13} /> {busy ? "Adding…" : "Add person"}</button>
                 <button className="lp-btn-ghost" onClick={() => { setAddingPerson(false); setErr(""); }}><X size={13} /> Cancel</button>
@@ -2255,6 +2301,24 @@ function AdminPanel() {
                         <ChoiceRow options={["Staff", "Contractor", "Manager"]} value={roleLabel(personDraft.role)}
                           onChange={(v) => setPersonDraft((d) => ({ ...d, role: v.toLowerCase() }))} />
                       </Field>
+                      {personDraft.role !== "manager" && (
+                        <>
+                          <div className="lp-row2">
+                            <Field label="Phone">
+                              <input className="lp-input" value={personDraft.phone} inputMode="tel" placeholder="e.g. 0412 345 678"
+                                onChange={(e) => setPersonDraft((d) => ({ ...d, phone: e.target.value }))} />
+                            </Field>
+                            <Field label="Business name">
+                              <input className="lp-input" value={personDraft.businessName} placeholder="Contractors only, if they trade under one"
+                                onChange={(e) => setPersonDraft((d) => ({ ...d, businessName: e.target.value }))} />
+                            </Field>
+                          </div>
+                          <Field label="Staff ID">
+                            <input className="lp-input" value={personDraft.staffId} placeholder={nextStaffId(personDraft.role, people)}
+                              onChange={(e) => setPersonDraft((d) => ({ ...d, staffId: e.target.value }))} />
+                          </Field>
+                        </>
+                      )}
                       <div className="lp-person-actions">
                         <button className="lp-btn-ghost" onClick={() => savePerson(person.id)} disabled={busy}>
                           <Check size={13} /> {busy ? "Saving…" : "Save"}
@@ -2266,11 +2330,15 @@ function AdminPanel() {
                     <div className="lp-person-head">
                       <div>
                         <strong>{person.name}</strong>
+                        {person.staff_id && <code className="lp-site-code">{person.staff_id}</code>}
                         {!person.active && <span className="lp-tag">Inactive</span>}
-                        <span className="lp-worker-type">{roleLabel(person.role)} · PIN {person.pin || "—"}</span>
+                        <span className="lp-worker-type">
+                          {[roleLabel(person.role), person.business_name, person.phone, `PIN ${person.pin || "—"}`]
+                            .filter(Boolean).join(" · ")}
+                        </span>
                       </div>
                       <div className="lp-person-actions">
-                        <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingPerson(person.id); setPersonDraft({ name: person.name, role: person.role, pin: person.pin || "" }); }}>
+                        <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingPerson(person.id); setPersonDraft({ name: person.name, role: person.role, pin: person.pin || "", phone: person.phone || "", businessName: person.business_name || "", staffId: person.staff_id || "" }); }}>
                           <Settings size={13} /> Edit
                         </button>
                         {!isManager && (
