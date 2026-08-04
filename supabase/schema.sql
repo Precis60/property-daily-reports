@@ -118,3 +118,27 @@ on conflict (id) do nothing;
 insert into people (id, name, role, pin)
 select 'manager-1', 'Manager', 'manager', manager_pin from app_settings
 on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------
+-- Manager schedule: each manager's own day, visible to all managers.
+-- Items another manager adds land as 'pending' until the owner approves.
+create table if not exists manager_schedule (
+  id         text primary key,
+  owner_id   text not null references people (id) on delete cascade,
+  date       date not null,
+  start_time text,
+  end_time   text,
+  title      text not null,
+  notes      text,
+  site_id    text references sites (id),
+  created_by text references people (id),
+  status     text not null default 'confirmed', -- confirmed | pending | declined
+  decided_at timestamptz,
+  active     boolean default true,
+  created_at timestamptz default now()
+);
+create index if not exists manager_schedule_owner_date_idx on manager_schedule (owner_id, date);
+create index if not exists manager_schedule_status_idx     on manager_schedule (status);
+
+alter table manager_schedule enable row level security;
+create policy manager_schedule_anon_all on manager_schedule for all to anon using (true) with check (true);
