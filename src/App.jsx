@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useContext, createContext } from "react";
+import { createClient } from "@supabase/supabase-js";
 import {
   Check, X, AlertTriangle, Clock, Camera, Lock, ChevronRight,
   ChevronDown, ChevronLeft, Plus, Trash2, ArrowLeft, Sun, ClipboardList, Settings,
@@ -27,10 +28,11 @@ const STATUS_OPTIONS = ["Complete", "Ongoing", "Waiting on materials", "Waiting 
 const TASK_COUNT_OPTIONS = ["1", "2", "3", "4", "5+"];
 const MAX_TASKS = 12;
 const STAFF_NAMES = ["Brett", "Chris"];
-const DEFAULT_PIN = "2468";
 const OPEN_CONTRACTOR_SLOTS = ["Contractor One", "Contractor Two"];
-const DEFAULT_STAFF_PINS = { Brett: "1701", Chris: "2802", "Contractor One": "5501", "Contractor Two": "6602" };
 const OUTSTANDING_LOOKBACK_DAYS = 90;
+
+const isEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((v || "").trim());
+const sameEmail = (a, b) => !!(a || "").trim() && (a || "").trim().toLowerCase() === (b || "").trim().toLowerCase();
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -171,6 +173,17 @@ async function compressImage(file, maxWidth = 720, quality = 0.55) {
 ------------------------------------------------------------------ */
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "https://rmwmwasgdpxlirxntfoy.supabase.co/rest/v1";
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJtd213YXNnZHB4bGlyeG50Zm95Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0MDgyMjYsImV4cCI6MjEwMDk4NDIyNn0.Zs6VJW79HyLE0Hm7l-FrgRIWljnN3dsTXyvontmDIkE";
+const SUPABASE_PROJECT_URL = SUPABASE_URL.replace(/\/rest\/v1\/?$/, "");
+
+export const supabase = createClient(SUPABASE_PROJECT_URL, SUPABASE_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true },
+});
+
+// Every REST call goes out as the signed-in user when there is one, so the
+// database sees a real identity rather than the shared anon role.
+let accessToken = null;
+supabase.auth.getSession().then(({ data }) => { accessToken = data.session?.access_token || null; });
+supabase.auth.onAuthStateChange((_event, session) => { accessToken = session?.access_token || null; });
 
 async function supabaseFetch(path, { method = "GET", body, timeoutMs = 15000 } = {}) {
   const controller = new AbortController();
@@ -181,7 +194,7 @@ async function supabaseFetch(path, { method = "GET", body, timeoutMs = 15000 } =
       method,
       headers: {
         apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
+        Authorization: `Bearer ${accessToken || SUPABASE_KEY}`,
         "Content-Type": "application/json",
         Prefer: method === "GET" ? undefined : "return=minimal",
       },
@@ -244,25 +257,6 @@ async function loadMonth(ym) {
     const rows = await supabaseFetch(`/reports?date=gte.${start}&date=lt.${nextMonth}&select=*`);
     return (rows || []).map(rowToReport);
   } catch { return []; }
-}
-
-async function loadSettings() {
-  try {
-    const rows = await supabaseFetch("/app_settings?id=eq.1&select=manager_pin,staff_pins");
-    const row = rows?.[0];
-    return {
-      managerPin: row?.manager_pin || DEFAULT_PIN,
-      staffPins: { ...DEFAULT_STAFF_PINS, ...(row?.staff_pins || {}) },
-    };
-  } catch { return { managerPin: DEFAULT_PIN, staffPins: DEFAULT_STAFF_PINS }; }
-}
-async function saveSettings(s) {
-  try {
-    await supabaseFetch("/app_settings?id=eq.1", {
-      method: "PATCH",
-      body: { manager_pin: s.managerPin, staff_pins: s.staffPins },
-    });
-  } catch (e) { console.error("save settings failed", e); }
 }
 
 async function loadPhotos(reportId) {
@@ -369,7 +363,7 @@ function expectedWindowLabel(task) {
 }
 async function loadPeople() {
   try {
-    const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role,pin&order=sort_order,name");
+    const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role,email&order=sort_order,name");
     return rows || [];
   } catch { return []; }
 }
@@ -401,7 +395,7 @@ async function loadAllSites() {
 
 async function loadAllPeople() {
   try {
-    const rows = await supabaseFetch("/people?select=id,name,role,pin,active,sort_order,phone,business_name,staff_id&order=sort_order,name");
+    const rows = await supabaseFetch("/people?select=id,name,role,email,active,sort_order,phone,business_name,staff_id&order=sort_order,name");
     return rows || [];
   } catch { return []; }
 }
@@ -540,9 +534,6 @@ async function saveSiteDetails(siteId, name, address) {
   await supabaseFetch(`/sites?id=eq.${siteId}`, { method: "PATCH", body: { name, address: address || null } });
 }
 
-async function savePersonPin(personId, pin) {
-  await supabaseFetch(`/people?id=eq.${personId}`, { method: "PATCH", body: { pin } });
-}
 
 function roleLabel(role) {
   if (role === "manager") return "Manager";
@@ -590,16 +581,159 @@ async function restoreBackup(file) {
 
 /* ================================================================== */
 
+/* ---------------- Auth ---------------- */
+const AuthContext = createContext(null);
+const useAuth = () => useContext(AuthContext);
+
+async function loadPersonForUser(userId, email) {
+  const select = "select=id,name,role,email,phone,business_name,staff_id,active,sort_order,auth_user_id";
+  // Match on the auth id first; fall back to the email so a person invited
+  // before this column existed still resolves, then stamp the link.
+  let rows = await supabaseFetch(`/people?auth_user_id=eq.${userId}&${select}`);
+  if (!rows?.length && email) {
+    rows = await supabaseFetch(`/people?email=eq.${encodeURIComponent(email)}&${select}`);
+    if (rows?.length) {
+      await supabaseFetch(`/people?id=eq.${rows[0].id}`, { method: "PATCH", body: { auth_user_id: userId } });
+    }
+  }
+  return rows?.[0] || null;
+}
+
+function AuthProvider({ children }) {
+  const [session, setSession] = useState(null);
+  const [person, setPerson] = useState(null);
+  const [siteIds, setSiteIds] = useState([]);
+  const [ready, setReady] = useState(false);
+
+  async function loadProfile(currentSession) {
+    if (!currentSession) { setPerson(null); setSiteIds([]); return; }
+    const user = currentSession.user;
+    const record = await loadPersonForUser(user.id, user.email);
+    setPerson(record);
+    if (record) {
+      const assignments = await loadSiteAssignments();
+      setSiteIds(assignments.filter((a) => a.person_id === record.id).map((a) => a.site_id));
+    } else {
+      setSiteIds([]);
+    }
+  }
+
+  useEffect(() => {
+    supabase.auth.getSession().then(async ({ data }) => {
+      setSession(data.session);
+      await loadProfile(data.session);
+      setReady(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange(async (_event, next) => {
+      setSession(next);
+      await loadProfile(next);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const value = {
+    session,
+    person,
+    siteIds,
+    ready,
+    isManager: person?.role === "manager",
+    signOut: () => supabase.auth.signOut(),
+    refreshProfile: () => loadProfile(session),
+  };
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+function LoginPage() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [resetSent, setResetSent] = useState(false);
+  const today = new Date();
+
+  async function signIn() {
+    if (!email.trim() || !password) { setErr("Enter your email and password."); return; }
+    setBusy(true); setErr("");
+    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    if (error) setErr(error.message === "Invalid login credentials" ? "That email and password don't match." : error.message);
+    setBusy(false);
+  }
+
+  async function sendReset() {
+    if (!email.trim()) { setErr("Enter your email first, then tap reset."); return; }
+    setBusy(true); setErr("");
+    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), { redirectTo: window.location.href });
+    if (error) setErr(error.message); else setResetSent(true);
+    setBusy(false);
+  }
+
+  return (
+    <div className="lp-home">
+      <div className="lp-home-letterhead">
+        <div className="lp-crest">LP</div>
+        <div>
+          <div className="lp-eyebrow">Property Maintenance</div>
+          <h1>Daily Work Report</h1>
+        </div>
+      </div>
+      <p className="lp-home-date">
+        {today.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
+      </p>
+
+      <div className="lp-gate lp-login">
+        <div className="lp-gate-icon"><Lock size={24} /></div>
+        <h2>Sign in</h2>
+        <p>Use the email address your manager set you up with.</p>
+        <Field label="Email">
+          <input className="lp-input" type="email" autoComplete="username" inputMode="email" value={email}
+            onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+        </Field>
+        <Field label="Password">
+          <input className="lp-input" type="password" autoComplete="current-password" value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") signIn(); }} />
+        </Field>
+        {err && <p className="lp-error">{err}</p>}
+        {resetSent && <p className="lp-saved"><Check size={13} /> Reset link sent — check your email.</p>}
+        <button type="button" className="lp-submit" onClick={signIn} disabled={busy}>
+          <ShieldCheck size={16} /> {busy ? "Signing in…" : "Sign in"}
+        </button>
+        <button type="button" className="lp-btn-ghost" onClick={sendReset} disabled={busy}>Forgotten your password?</button>
+      </div>
+
+      <p className="lp-home-footnote">Facts, not opinions — every entry is time-stamped and photo-verified.</p>
+    </div>
+  );
+}
+
+// A login with no matching people row can't be placed in the app: it has no
+// name, role or sites. Better to say so than to show an empty dashboard.
+function NoProfileScreen({ email, onSignOut }) {
+  return (
+    <div className="lp-page">
+      <TopBar title="Daily Work Report" right={<button className="lp-btn-ghost" onClick={onSignOut}><LogOut size={14} /> Sign out</button>} />
+      <div className="lp-gate">
+        <div className="lp-gate-icon"><AlertTriangle size={24} /></div>
+        <h2>Your login isn't linked to a staff record</h2>
+        <p>{email} signed in, but no one on the roster uses that address. Ask a manager to add it against your name in Admin → People.</p>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
-  const [view, setView] = useState("home"); // home | form | submitted | managerGate | manager
+  return (
+    <AuthProvider>
+      <AppShell />
+    </AuthProvider>
+  );
+}
+
+function AppShell() {
+  const { ready, session, person, isManager, signOut } = useAuth();
+  const [view, setView] = useState("form"); // form | submitted | account
   const [monthsIndex, setMonthsIndex] = useState([]);
-  const [settings, setSettings] = useState({ managerPin: DEFAULT_PIN, staffPins: DEFAULT_STAFF_PINS });
   const [loading, setLoading] = useState(true);
-  const [managerAuthed, setManagerAuthed] = useState(false);
-  const [currentManager, setCurrentManager] = useState(null);
-  const [pendingManager, setPendingManager] = useState(null);
-  const [presetName, setPresetName] = useState("");
-  const [pendingStaff, setPendingStaff] = useState("");
   const [cacheVersion, setCacheVersion] = useState(0);
   const [assignedTasks, setAssignedTasks] = useState([]);
   const [people, setPeople] = useState([]);
@@ -607,9 +741,8 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [idx, s, at, ppl] = await Promise.all([loadIndex(), loadSettings(), loadAssignedTasks(), loadPeople()]);
+      const [idx, at, ppl] = await Promise.all([loadIndex(), loadAssignedTasks(), loadPeople()]);
       setMonthsIndex(idx);
-      setSettings(s);
       setAssignedTasks(at);
       setPeople(ppl);
       const ym = monthOf(todayISO());
@@ -679,14 +812,6 @@ export default function App() {
     : [...STAFF_NAMES.map((name) => ({ id: name, name, role: "staff" })),
        ...OPEN_CONTRACTOR_SLOTS.map((name) => ({ id: name, name, role: "contractor" }))];
   const managers = people.filter((p) => p.role === "manager");
-  const managerPins = managers.map((p) => p.pin).filter(Boolean);
-
-  function pinFor(name) {
-    return people.find((p) => p.name === name)?.pin || settings.staffPins?.[name] || "";
-  }
-  function isSharedSlot(name) {
-    return OPEN_CONTRACTOR_SLOTS.includes(name);
-  }
 
   async function handleRestored() {
     cacheRef.current = {};
@@ -698,66 +823,45 @@ export default function App() {
     setCacheVersion((v) => v + 1);
   }
 
+  if (!ready) {
+    return (
+      <div className="lp-root">
+        <style>{CSS}</style>
+        <div className="lp-loading"><Sun size={22} /><span>Loading Property Daily Reports…</span></div>
+      </div>
+    );
+  }
+  if (!session) {
+    return (
+      <div className="lp-root">
+        <style>{CSS}</style>
+        <LoginPage />
+      </div>
+    );
+  }
+  if (!person) {
+    return (
+      <div className="lp-root">
+        <style>{CSS}</style>
+        <NoProfileScreen email={session.user.email} onSignOut={signOut} />
+      </div>
+    );
+  }
+
   return (
     <div className="lp-root">
       <style>{CSS}</style>
       {loading ? (
         <div className="lp-loading"><Sun size={22} /><span>Loading Property Daily Reports…</span></div>
-      ) : view === "home" ? (
-        <Home
-          workers={workers}
-          onWorker={(name) => {
-            if (name && pinFor(name)) { setPendingStaff(name); setView("staffGate"); }
-            else { setPresetName(name); setView("form"); }
-          }}
-          managers={managers}
-          onManager={(manager) => {
-            setPendingManager(manager || null);
-            if (managerAuthed && (!manager || manager.id === currentManager?.id)) setView("manager");
-            else setView("managerGate");
-          }}
-        />
-      ) : view === "staffGate" ? (
-        <StaffGate
-          staffName={pendingStaff}
-          pin={pinFor(pendingStaff)}
-          onBack={() => setView("home")}
-          onSuccess={() => {
-            setPresetName(isSharedSlot(pendingStaff) ? "" : pendingStaff);
-            setView("form");
-          }}
-        />
-      ) : view === "form" ? (
-        <WorkerForm
-          presetName={presetName}
-          worker={workers.find((w) => w.name === presetName && w.role !== "manager") || null}
-          workerNames={workers.map((w) => w.name)}
-          assignedTasks={assignedTasks}
-          onAcknowledge={acknowledgeAssignedTask}
-          onBack={() => setView("home")}
-          onSubmitted={async (report, photos) => { await addReport(report, photos); setView("submitted"); }}
-        />
-      ) : view === "submitted" ? (
-        <SubmittedScreen onHome={() => setView("home")} />
-      ) : view === "managerGate" ? (
-        <ManagerGate
-          managerName={pendingManager?.name}
-          pin={pendingManager ? pendingManager.pin : settings.managerPin}
-          extraPins={pendingManager ? [] : managerPins}
-          onBack={() => setView("home")}
-          onSuccess={() => { setManagerAuthed(true); setCurrentManager(pendingManager); setView("manager"); }}
-        />
-      ) : (
+      ) : isManager ? (
         <ManagerDashboard
           workers={workers}
           managers={managers}
-          currentManager={currentManager}
+          currentManager={person}
           monthsIndex={monthsIndex}
           getMonths={getMonths}
           refreshMonths={refreshMonths}
           cacheVersion={cacheVersion}
-          settings={settings}
-          onSettingsChange={async (s) => { setSettings(s); await saveSettings(s); }}
           assignedTasks={assignedTasks}
           onAcknowledgeAssignedTask={acknowledgeAssignedTask}
           onAddReport={addReport}
@@ -766,77 +870,33 @@ export default function App() {
           onAddAssignedTask={addAssignedTask}
           onRemoveAssignedTask={removeAssignedTask}
           onRestored={handleRestored}
-          onExit={() => { setManagerAuthed(false); setCurrentManager(null); setView("home"); }}
+          onExit={signOut}
+        />
+      ) : view === "submitted" ? (
+        <SubmittedScreen onHome={() => setView("form")} />
+      ) : view === "account" ? (
+        <div className="lp-page">
+          <TopBar title="Your account" onBack={() => setView("form")} />
+          <AccountPanel />
+        </div>
+      ) : (
+        <WorkerForm
+          presetName={person.name}
+          worker={person}
+          workerNames={workers.map((w) => w.name)}
+          assignedTasks={assignedTasks}
+          onAcknowledge={acknowledgeAssignedTask}
+          onBack={signOut}
+          backLabel="Sign out"
+          onAccount={() => setView("account")}
+          onSubmitted={async (report, photos) => { await addReport(report, photos); setView("submitted"); }}
         />
       )}
     </div>
   );
 }
 
-/* ---------------- Home ---------------- */
-function Home({ workers, managers, onWorker, onManager }) {
-  const today = new Date();
-  return (
-    <div className="lp-home">
-      <div className="lp-home-letterhead">
-        <div className="lp-crest">LP</div>
-        <div>
-          <div className="lp-eyebrow">Property Maintenance</div>
-          <h1>Daily Work Report</h1>
-        </div>
-      </div>
-      <p className="lp-home-date">
-        {today.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
-      </p>
-
-      <div className="lp-staff-section">
-        <span className="lp-eyebrow">Submit Daily Report</span>
-        <div className="lp-staff-grid">
-          {workers.map((person) => {
-            const contractor = person.role === "contractor";
-            return (
-              <button
-                className={`lp-staff-card ${contractor ? "lp-staff-card--other" : ""}`}
-                key={person.id}
-                onClick={() => onWorker(person.name)}
-              >
-                <span className={`lp-staff-initial ${contractor ? "lp-staff-initial--other" : ""}`}>
-                  {person.name[0]}
-                </span>
-                <span className="lp-staff-name">{person.name}</span>
-                <ChevronRight size={17} className="lp-chev" />
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {managers.length ? (
-        <div className="lp-staff-section">
-          <span className="lp-eyebrow">Manager dashboard</span>
-          <div className="lp-staff-grid">
-            {managers.map((m) => (
-              <button className="lp-staff-card lp-staff-card--manager" key={m.id} onClick={() => onManager(m)}>
-                <span className="lp-staff-initial lp-staff-initial--manager"><Lock size={14} /></span>
-                <span className="lp-staff-name">{m.name}</span>
-                <ChevronRight size={17} className="lp-chev" />
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : (
-        <button className="lp-home-card lp-home-card--manager" onClick={() => onManager(null)}>
-          <Lock size={22} />
-          <div><h2>Manager dashboard</h2><p>Daily brief, outstanding jobs and full history. PIN required.</p></div>
-          <ChevronRight size={20} className="lp-chev" />
-        </button>
-      )}
-
-      <p className="lp-home-footnote">Facts, not opinions — every entry is time-stamped and photo-verified.</p>
-    </div>
-  );
-}
-
+/* ---------------- Staff tasks ---------------- */
 function StaffTasksPanel({ person }) {
   const [date, setDate] = useState(todayISO());
   const [tasks, setTasks] = useState([]);
@@ -946,8 +1006,93 @@ function StaffTasksPanel({ person }) {
   );
 }
 
+/* ---------------- Account ---------------- */
+// Password changes re-check the current password first; email changes go
+// through Supabase, which mails a confirmation link to both the old and the
+// new address, so neither can be changed from an unattended phone.
+function AccountPanel() {
+  const { session, person, refreshProfile } = useAuth();
+  const currentEmail = session?.user?.email || "";
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwMsg, setPwMsg] = useState("");
+  const [pwErr, setPwErr] = useState("");
+  const [email, setEmail] = useState(currentEmail);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailMsg, setEmailMsg] = useState("");
+  const [emailErr, setEmailErr] = useState("");
+
+  async function changePassword() {
+    setPwMsg(""); setPwErr("");
+    if (!current) { setPwErr("Enter your current password."); return; }
+    if (next.length < 8) { setPwErr("Your new password needs at least 8 characters."); return; }
+    setPwBusy(true);
+    const check = await supabase.auth.signInWithPassword({ email: currentEmail, password: current });
+    if (check.error) { setPwErr("That current password isn't right."); setPwBusy(false); return; }
+    const { error } = await supabase.auth.updateUser({ password: next });
+    if (error) setPwErr(error.message);
+    else { setPwMsg("Password changed."); setCurrent(""); setNext(""); }
+    setPwBusy(false);
+  }
+
+  async function changeEmail() {
+    setEmailMsg(""); setEmailErr("");
+    if (!isEmail(email)) { setEmailErr("Enter a valid email address."); return; }
+    if (sameEmail(email, currentEmail)) { setEmailErr("That's already your email address."); return; }
+    setEmailBusy(true);
+    const { error } = await supabase.auth.updateUser({ email: email.trim() }, { emailRedirectTo: window.location.href });
+    if (error) {
+      setEmailErr(error.message);
+    } else {
+      // The people row only follows once the new address is confirmed, so the
+      // roster never points at an address nobody can receive mail at.
+      setEmailMsg(`Check ${email.trim()} and ${currentEmail} — the change takes effect once you've clicked the link in both.`);
+    }
+    setEmailBusy(false);
+  }
+
+  useEffect(() => {
+    // Coming back from a confirmation link, the auth email has moved on while
+    // the roster hasn't; bring the people row into line.
+    if (!person || !currentEmail || sameEmail(person.email, currentEmail)) return;
+    supabaseFetch(`/people?id=eq.${person.id}`, { method: "PATCH", body: { email: currentEmail.toLowerCase() } })
+      .then(() => refreshProfile());
+  }, [currentEmail, person, refreshProfile]);
+
+  return (
+    <div className="lp-settings">
+      <h3><Lock size={16} /> Your password</h3>
+      <p className="lp-hint">You need your current password to set a new one.</p>
+      <Field label="Current password">
+        <input className="lp-input" type="password" autoComplete="current-password" value={current}
+          onChange={(e) => { setCurrent(e.target.value); setPwMsg(""); }} />
+      </Field>
+      <Field label="New password">
+        <input className="lp-input" type="password" autoComplete="new-password" value={next}
+          onChange={(e) => { setNext(e.target.value); setPwMsg(""); }} />
+      </Field>
+      <button className="lp-btn-ghost" onClick={changePassword} disabled={pwBusy}>{pwBusy ? "Saving…" : "Change password"}</button>
+      {pwErr && <p className="lp-error">{pwErr}</p>}
+      {pwMsg && <p className="lp-saved"><Check size={13} /> {pwMsg}</p>}
+
+      <hr className="lp-settings-divider" />
+
+      <h3><Settings size={16} /> Your email address</h3>
+      <p className="lp-hint">Signed in as {currentEmail}. Changing it sends a confirmation link to both your old and your new address — the change only happens once you've clicked both.</p>
+      <Field label="Email address">
+        <input className="lp-input" type="email" inputMode="email" value={email}
+          onChange={(e) => { setEmail(e.target.value); setEmailMsg(""); }} />
+      </Field>
+      <button className="lp-btn-ghost" onClick={changeEmail} disabled={emailBusy}>{emailBusy ? "Sending…" : "Change email"}</button>
+      {emailErr && <p className="lp-error">{emailErr}</p>}
+      {emailMsg && <p className="lp-saved"><Check size={13} /> {emailMsg}</p>}
+    </div>
+  );
+}
+
 /* ---------------- Worker Form ---------------- */
-function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, worker = null, embedded = false, requirePhotos = true }) {
+function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, worker = null, embedded = false, requirePhotos = true, backLabel, onAccount }) {
   const [workerType, setWorkerType] = useState("");
   const [workerName, setWorkerName] = useState(presetName || "");
   const [siteId, setSiteId] = useState("");
@@ -1104,7 +1249,14 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
 
   return (
     <div className={embedded ? "" : "lp-page"}>
-      {!embedded && <TopBar title="Daily Work Report" onBack={onBack} />}
+      {!embedded && (
+        <TopBar
+          title="Daily Work Report"
+          onBack={onBack}
+          backLabel={backLabel}
+          right={onAccount && <button className="lp-btn-ghost" onClick={onAccount}><Settings size={14} /> Account</button>}
+        />
+      )}
       <div className="lp-form">
         {worker && <StaffTasksPanel person={worker} />}
         <Section n="1" title="About today">
@@ -1312,10 +1464,10 @@ function TaskBlock({ index, task, workerName, workerNames, onChange, onRemove })
 }
 
 /* ---------------- small building blocks ---------------- */
-function TopBar({ title, onBack, right }) {
+function TopBar({ title, onBack, right, backLabel }) {
   return (
     <div className="lp-topbar">
-      <button className="lp-back" onClick={onBack}><ArrowLeft size={18} /></button>
+      <button className="lp-back" onClick={onBack} aria-label={backLabel || "Back"}><ArrowLeft size={18} /></button>
       <span className="lp-topbar-title">{title}</span>
       {right}
     </div>
@@ -1353,71 +1505,8 @@ function SubmittedScreen({ onHome }) {
   );
 }
 
-/* ---------------- Staff gate ---------------- */
-function StaffGate({ staffName, pin, onBack, onSuccess }) {
-  const [value, setValue] = useState("");
-  const [err, setErr] = useState("");
-  function submit() {
-    if (value.trim() === String(pin || "").trim()) onSuccess();
-    else { setErr("Incorrect PIN."); setValue(""); }
-  }
-  return (
-    <div className="lp-page">
-      <TopBar title="Submit Daily Report" onBack={onBack} />
-      <div className="lp-gate">
-        <div className="lp-gate-icon"><Lock size={24} /></div>
-        <h2>Hi {staffName} — enter your PIN</h2>
-        <p>Only you and the property manager know this PIN. It keeps your reports as yours.</p>
-        <input
-          type="text" inputMode="numeric" pattern="[0-9]*" autoComplete="off" autoCorrect="off"
-          autoCapitalize="off" spellCheck="false" name="staff-pin"
-          className="lp-input lp-gate-input lp-pin-mask" placeholder="Enter PIN"
-          value={value} onChange={(e) => setValue(e.target.value.replace(/\D/g, ""))}
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          autoFocus
-        />
-        {err && <p className="lp-error">{err}</p>}
-        <button type="button" className="lp-submit" onClick={submit}><ShieldCheck size={16} /> Continue</button>
-        <p className="lp-hint lp-gate-default">Forgotten your PIN? Ask your property manager.</p>
-      </div>
-    </div>
-  );
-}
-
-/* ---------------- Manager gate ---------------- */
-function ManagerGate({ managerName, pin, extraPins = [], onBack, onSuccess }) {
-  const [value, setValue] = useState("");
-  const [err, setErr] = useState("");
-  const accepted = [pin, ...extraPins].filter(Boolean).map((p) => String(p).trim());
-  function submit() {
-    if (accepted.includes(value.trim())) onSuccess();
-    else { setErr("Incorrect PIN."); setValue(""); }
-  }
-  return (
-    <div className="lp-page">
-      <TopBar title="Manager dashboard" onBack={onBack} />
-      <div className="lp-gate">
-        <div className="lp-gate-icon"><Lock size={24} /></div>
-        <h2>{managerName ? `Hi ${managerName} — enter your PIN` : "Manager access only"}</h2>
-        <p>Daily summaries and reports are only visible to the property managers.</p>
-        <input
-          type="text" inputMode="numeric" pattern="[0-9]*" autoComplete="off" autoCorrect="off"
-          autoCapitalize="off" spellCheck="false" name="manager-pin"
-          className="lp-input lp-gate-input lp-pin-mask" placeholder="Enter PIN"
-          value={value} onChange={(e) => setValue(e.target.value.replace(/\D/g, ""))}
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          autoFocus
-        />
-        {err && <p className="lp-error">{err}</p>}
-        <button type="button" className="lp-submit" onClick={submit}><ShieldCheck size={16} /> Unlock</button>
-        <p className="lp-hint lp-gate-default">Default PIN is {DEFAULT_PIN} until changed in Settings.</p>
-      </div>
-    </div>
-  );
-}
-
 /* ---------------- Manager dashboard ---------------- */
-function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onAcknowledgeAssignedTask, onAddReport, onDeleteReport, onRestored, onExit }) {
+function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getMonths, refreshMonths, cacheVersion, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onAcknowledgeAssignedTask, onAddReport, onDeleteReport, onRestored, onExit }) {
   const [tab, setTab] = useState("brief");
   const [reportSaved, setReportSaved] = useState(false);
   return (
@@ -1458,7 +1547,7 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
       {tab === "schedule" && <ManagerSchedulePanel managers={managers} currentManager={currentManager} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
       {tab === "sites" && <AdminPanel />}
-      {tab === "settings" && <ManagerSettings workers={workers} settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
+      {tab === "settings" && <ManagerSettings onRestored={onRestored} />}
     </div>
   );
 }
@@ -2558,7 +2647,7 @@ function AdminPanel() {
   const [addingSite, setAddingSite] = useState(false);
 
   const [editingPerson, setEditingPerson] = useState(null);
-  const emptyPerson = { name: "", role: "staff", pin: "", phone: "", businessName: "", staffId: "" };
+  const emptyPerson = { name: "", role: "staff", email: "", phone: "", businessName: "", staffId: "" };
   const [personDraft, setPersonDraft] = useState(emptyPerson);
   const [newPerson, setNewPerson] = useState(emptyPerson);
   const [addingPerson, setAddingPerson] = useState(false);
@@ -2610,15 +2699,15 @@ function AdminPanel() {
 
   async function addPerson() {
     if (!newPerson.name.trim()) { setErr("Enter a name."); return; }
-    if (!/^\d{4}$/.test(newPerson.pin.trim())) { setErr("PINs are 4 digits."); return; }
-    if (people.some((p) => p.active && p.pin === newPerson.pin.trim())) { setErr("That PIN is already in use."); return; }
+    if (!isEmail(newPerson.email)) { setErr("Enter a valid login email."); return; }
+    if (people.some((p) => sameEmail(p.email, newPerson.email))) { setErr("That email is already used by someone else."); return; }
     const newStaffId = newPerson.staffId.trim() || nextStaffId(newPerson.role, people);
     if (newStaffId && people.some((p) => p.staff_id === newStaffId)) { setErr("That staff ID is already in use."); return; }
     const ok = await run(() => createPerson({
       id: personIdFrom(newPerson.name, people.map((p) => p.id)),
       name: newPerson.name.trim(),
       role: newPerson.role,
-      pin: newPerson.pin.trim(),
+      email: newPerson.email.trim().toLowerCase(),
       phone: newPerson.phone.trim() || null,
       business_name: newPerson.businessName.trim() || null,
       staff_id: newStaffId || null,
@@ -2630,9 +2719,9 @@ function AdminPanel() {
 
   async function savePerson(personId) {
     if (!personDraft.name.trim()) { setErr("Enter a name."); return; }
-    if (!/^\d{4}$/.test(personDraft.pin.trim())) { setErr("PINs are 4 digits."); return; }
-    if (people.some((p) => p.active && p.id !== personId && p.pin === personDraft.pin.trim())) {
-      setErr("That PIN is already in use."); return;
+    if (!isEmail(personDraft.email)) { setErr("Enter a valid login email."); return; }
+    if (people.some((p) => p.id !== personId && sameEmail(p.email, personDraft.email))) {
+      setErr("That email is already used by someone else."); return;
     }
     const draftStaffId = personDraft.staffId.trim();
     if (draftStaffId && people.some((p) => p.id !== personId && p.staff_id === draftStaffId)) {
@@ -2641,7 +2730,7 @@ function AdminPanel() {
     const ok = await run(() => updatePerson(personId, {
       name: personDraft.name.trim(),
       role: personDraft.role,
-      pin: personDraft.pin.trim(),
+      email: personDraft.email.trim().toLowerCase(),
       phone: personDraft.phone.trim() || null,
       business_name: personDraft.businessName.trim() || null,
       staff_id: draftStaffId || null,
@@ -2764,9 +2853,9 @@ function AdminPanel() {
                   <input className="lp-input" value={newPerson.name} placeholder="Full name"
                     onChange={(e) => setNewPerson((d) => ({ ...d, name: e.target.value }))} />
                 </Field>
-                <Field label="Login PIN">
-                  <input className="lp-input" value={newPerson.pin} inputMode="numeric" maxLength={4} placeholder="4 digits"
-                    onChange={(e) => setNewPerson((d) => ({ ...d, pin: e.target.value }))} />
+                <Field label="Login email">
+                  <input className="lp-input" type="email" inputMode="email" value={newPerson.email} placeholder="name@example.com"
+                    onChange={(e) => setNewPerson((d) => ({ ...d, email: e.target.value }))} />
                 </Field>
               </div>
               <Field label="Role">
@@ -2814,9 +2903,9 @@ function AdminPanel() {
                           <input className="lp-input" value={personDraft.name}
                             onChange={(e) => setPersonDraft((d) => ({ ...d, name: e.target.value }))} />
                         </Field>
-                        <Field label="Login PIN">
-                          <input className="lp-input" value={personDraft.pin} inputMode="numeric" maxLength={4}
-                            onChange={(e) => setPersonDraft((d) => ({ ...d, pin: e.target.value }))} />
+                        <Field label="Login email">
+                          <input className="lp-input" type="email" inputMode="email" value={personDraft.email} placeholder="name@example.com"
+                            onChange={(e) => setPersonDraft((d) => ({ ...d, email: e.target.value }))} />
                         </Field>
                       </div>
                       <Field label="Role">
@@ -2855,12 +2944,12 @@ function AdminPanel() {
                         {person.staff_id && <code className="lp-site-code">{person.staff_id}</code>}
                         {!person.active && <span className="lp-tag">Inactive</span>}
                         <span className="lp-worker-type">
-                          {[roleLabel(person.role), person.business_name, person.phone, `PIN ${person.pin || "—"}`]
+                          {[roleLabel(person.role), person.business_name, person.phone, person.email || "no login email"]
                             .filter(Boolean).join(" · ")}
                         </span>
                       </div>
                       <div className="lp-person-actions">
-                        <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingPerson(person.id); setPersonDraft({ name: person.name, role: person.role, pin: person.pin || "", phone: person.phone || "", businessName: person.business_name || "", staffId: person.staff_id || "" }); }}>
+                        <button className="lp-btn-ghost" onClick={() => { setErr(""); setEditingPerson(person.id); setPersonDraft({ name: person.name, role: person.role, email: person.email || "", phone: person.phone || "", businessName: person.business_name || "", staffId: person.staff_id || "" }); }}>
                           <Settings size={13} /> Edit
                         </button>
                         {!isManager && (
@@ -2912,31 +3001,13 @@ function AdminPanel() {
   );
 }
 
-function ManagerSettings({ workers, settings, onChange, onRestored }) {
-  const [pin, setPin] = useState(settings.managerPin || DEFAULT_PIN);
-  const [saved, setSaved] = useState(false);
-  const [staffPins, setStaffPins] = useState({}); // person id -> edited pin
-  const [staffSaved, setStaffSaved] = useState(false);
-  const [pinSaving, setPinSaving] = useState(false);
-  const [pinError, setPinError] = useState("");
+function ManagerSettings({ onRestored }) {
   const [exporting, setExporting] = useState(false);
   const [exportErr, setExportErr] = useState("");
   const [restoring, setRestoring] = useState(false);
   const [restoreMsg, setRestoreMsg] = useState("");
   const [restoreErr, setRestoreErr] = useState("");
   const [confirmRestore, setConfirmRestore] = useState(false);
-
-  async function saveStaffPins() {
-    setPinSaving(true); setPinError(""); setStaffSaved(false);
-    try {
-      const edited = Object.entries(staffPins).filter(([id, v]) => v !== workers.find((w) => w.id === id)?.pin);
-      await Promise.all(edited.map(([id, v]) => savePersonPin(id, v)));
-      setStaffSaved(true);
-    } catch (e) {
-      setPinError(e.message || "Couldn't save those PINs — try again.");
-    }
-    setPinSaving(false);
-  }
 
   async function handleExport() {
     setExporting(true); setExportErr("");
@@ -2955,34 +3026,8 @@ function ManagerSettings({ workers, settings, onChange, onRestored }) {
 
   return (
     <div className="lp-settings">
-      <h3><Settings size={16} /> Manager PIN</h3>
-      <p className="lp-hint">Change the PIN used to unlock the manager dashboard.</p>
-      <div className="lp-settings-row">
-        <input className="lp-input lp-input--slim" value={pin} onChange={(e) => { setPin(e.target.value); setSaved(false); }} />
-        <button className="lp-btn-ghost" onClick={() => { onChange({ ...settings, managerPin: pin }); setSaved(true); }}>Save</button>
-      </div>
-      {saved && <p className="lp-saved"><Check size={13} /> Saved</p>}
-      <p className="lp-hint lp-settings-note">Data is stored centrally and shared between everyone using this app link — workers only ever see the submission form, never past reports or this dashboard.</p>
-
-      <hr className="lp-settings-divider" />
-
-      <h3><Lock size={16} /> Staff PINs</h3>
-      <p className="lp-hint">Each PIN unlocks that person's "Submit Daily Report" button. Named staff are locked to their own name; Contractor One and Contractor Two are shared entry points — the PIN keeps them restricted to whoever you give it to, but they still type in their own name once inside.</p>
-      <div className="lp-staff-pin-list">
-        {workers.map((person) => (
-          <div className="lp-settings-row" key={person.id}>
-            <span className="lp-staff-pin-label">{person.name}</span>
-            <input
-              className="lp-input lp-input--slim" inputMode="numeric"
-              value={staffPins[person.id] ?? person.pin ?? ""}
-              onChange={(e) => { setStaffPins((p) => ({ ...p, [person.id]: e.target.value })); setStaffSaved(false); }}
-            />
-          </div>
-        ))}
-        <button className="lp-btn-ghost" onClick={saveStaffPins} disabled={pinSaving}>{pinSaving ? "Saving…" : "Save PINs"}</button>
-      </div>
-      {pinError && <p className="lp-error">{pinError}</p>}
-      {staffSaved && <p className="lp-saved"><Check size={13} /> Saved — reload the app for new PINs to take effect.</p>}
+      <AccountPanel />
+      <p className="lp-hint lp-settings-note">Data is stored centrally and shared between everyone using this app link — staff only ever see the submission form and their own tasks, never this dashboard.</p>
 
       <hr className="lp-settings-divider" />
 
