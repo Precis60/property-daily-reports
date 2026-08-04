@@ -397,6 +397,21 @@ async function savePersonSites(personId, siteIds) {
   });
 }
 
+async function loadManagerSchedule(ownerId) {
+  try {
+    const rows = await supabaseFetch(`/manager_schedule?owner_id=eq.${ownerId}&active=eq.true&select=*&order=date,start_time`);
+    return rows || [];
+  } catch { return []; }
+}
+
+async function createScheduleItem(item) {
+  await supabaseFetch("/manager_schedule", { method: "POST", body: [item] });
+}
+
+async function updateScheduleItem(id, patch) {
+  await supabaseFetch(`/manager_schedule?id=eq.${id}`, { method: "PATCH", body: patch });
+}
+
 async function savePersonPin(personId, pin) {
   await supabaseFetch(`/people?id=eq.${personId}`, { method: "PATCH", body: { pin } });
 }
@@ -453,6 +468,8 @@ export default function App() {
   const [settings, setSettings] = useState({ managerPin: DEFAULT_PIN, staffPins: DEFAULT_STAFF_PINS });
   const [loading, setLoading] = useState(true);
   const [managerAuthed, setManagerAuthed] = useState(false);
+  const [currentManager, setCurrentManager] = useState(null);
+  const [pendingManager, setPendingManager] = useState(null);
   const [presetName, setPresetName] = useState("");
   const [pendingStaff, setPendingStaff] = useState("");
   const [cacheVersion, setCacheVersion] = useState(0);
@@ -533,7 +550,8 @@ export default function App() {
     ? people.filter((p) => p.role !== "manager")
     : [...STAFF_NAMES.map((name) => ({ id: name, name, role: "staff" })),
        ...OPEN_CONTRACTOR_SLOTS.map((name) => ({ id: name, name, role: "contractor" }))];
-  const managerPins = people.filter((p) => p.role === "manager").map((p) => p.pin).filter(Boolean);
+  const managers = people.filter((p) => p.role === "manager");
+  const managerPins = managers.map((p) => p.pin).filter(Boolean);
 
   function pinFor(name) {
     return people.find((p) => p.name === name)?.pin || settings.staffPins?.[name] || "";
@@ -564,7 +582,12 @@ export default function App() {
             if (name && pinFor(name)) { setPendingStaff(name); setView("staffGate"); }
             else { setPresetName(name); setView("form"); }
           }}
-          onManager={() => setView(managerAuthed ? "manager" : "managerGate")}
+          managers={managers}
+          onManager={(manager) => {
+            setPendingManager(manager || null);
+            if (managerAuthed && (!manager || manager.id === currentManager?.id)) setView("manager");
+            else setView("managerGate");
+          }}
         />
       ) : view === "staffGate" ? (
         <StaffGate
@@ -588,10 +611,18 @@ export default function App() {
       ) : view === "submitted" ? (
         <SubmittedScreen onHome={() => setView("home")} />
       ) : view === "managerGate" ? (
-        <ManagerGate pin={settings.managerPin} extraPins={managerPins} onBack={() => setView("home")} onSuccess={() => { setManagerAuthed(true); setView("manager"); }} />
+        <ManagerGate
+          managerName={pendingManager?.name}
+          pin={pendingManager ? pendingManager.pin : settings.managerPin}
+          extraPins={pendingManager ? [] : managerPins}
+          onBack={() => setView("home")}
+          onSuccess={() => { setManagerAuthed(true); setCurrentManager(pendingManager); setView("manager"); }}
+        />
       ) : (
         <ManagerDashboard
           workers={workers}
+          managers={managers}
+          currentManager={currentManager}
           monthsIndex={monthsIndex}
           getMonths={getMonths}
           refreshMonths={refreshMonths}
@@ -604,7 +635,7 @@ export default function App() {
           onAddAssignedTask={addAssignedTask}
           onRemoveAssignedTask={removeAssignedTask}
           onRestored={handleRestored}
-          onExit={() => { setManagerAuthed(false); setView("home"); }}
+          onExit={() => { setManagerAuthed(false); setCurrentManager(null); setView("home"); }}
         />
       )}
     </div>
@@ -612,7 +643,7 @@ export default function App() {
 }
 
 /* ---------------- Home ---------------- */
-function Home({ workers, onWorker, onManager }) {
+function Home({ workers, managers, onWorker, onManager }) {
   const today = new Date();
   return (
     <div className="lp-home">
@@ -649,11 +680,26 @@ function Home({ workers, onWorker, onManager }) {
         </div>
       </div>
 
-      <button className="lp-home-card lp-home-card--manager" onClick={onManager}>
-        <Lock size={22} />
-        <div><h2>Manager dashboard</h2><p>Daily brief, outstanding jobs and full history. PIN required.</p></div>
-        <ChevronRight size={20} className="lp-chev" />
-      </button>
+      {managers.length ? (
+        <div className="lp-staff-section">
+          <span className="lp-eyebrow">Manager dashboard</span>
+          <div className="lp-staff-grid">
+            {managers.map((m) => (
+              <button className="lp-staff-card lp-staff-card--manager" key={m.id} onClick={() => onManager(m)}>
+                <span className="lp-staff-initial lp-staff-initial--manager"><Lock size={14} /></span>
+                <span className="lp-staff-name">{m.name}</span>
+                <ChevronRight size={17} className="lp-chev" />
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <button className="lp-home-card lp-home-card--manager" onClick={() => onManager(null)}>
+          <Lock size={22} />
+          <div><h2>Manager dashboard</h2><p>Daily brief, outstanding jobs and full history. PIN required.</p></div>
+          <ChevronRight size={20} className="lp-chev" />
+        </button>
+      )}
 
       <p className="lp-home-footnote">Facts, not opinions — every entry is time-stamped and photo-verified.</p>
     </div>
@@ -1068,7 +1114,7 @@ function StaffGate({ staffName, pin, onBack, onSuccess }) {
 }
 
 /* ---------------- Manager gate ---------------- */
-function ManagerGate({ pin, extraPins = [], onBack, onSuccess }) {
+function ManagerGate({ managerName, pin, extraPins = [], onBack, onSuccess }) {
   const [value, setValue] = useState("");
   const [err, setErr] = useState("");
   const accepted = [pin, ...extraPins].filter(Boolean).map((p) => String(p).trim());
@@ -1081,8 +1127,8 @@ function ManagerGate({ pin, extraPins = [], onBack, onSuccess }) {
       <TopBar title="Manager dashboard" onBack={onBack} />
       <div className="lp-gate">
         <div className="lp-gate-icon"><Lock size={24} /></div>
-        <h2>Manager access only</h2>
-        <p>Daily summaries and reports are only visible to the property manager.</p>
+        <h2>{managerName ? `Hi ${managerName} — enter your PIN` : "Manager access only"}</h2>
+        <p>Daily summaries and reports are only visible to the property managers.</p>
         <input
           type="text" inputMode="numeric" pattern="[0-9]*" autoComplete="off" autoCorrect="off"
           autoCapitalize="off" spellCheck="false" name="manager-pin"
@@ -1100,7 +1146,7 @@ function ManagerGate({ pin, extraPins = [], onBack, onSuccess }) {
 }
 
 /* ---------------- Manager dashboard ---------------- */
-function ManagerDashboard({ workers, monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onDeleteReport, onRestored, onExit }) {
+function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onDeleteReport, onRestored, onExit }) {
   const [tab, setTab] = useState("brief");
   return (
     <div className="lp-page lp-page--manager">
@@ -1108,15 +1154,195 @@ function ManagerDashboard({ workers, monthsIndex, getMonths, refreshMonths, cach
       <div className="lp-tabs">
         <button className={`lp-tab ${tab === "brief" ? "is-active" : ""}`} onClick={() => setTab("brief")}>Morning brief</button>
         <button className={`lp-tab ${tab === "assign" ? "is-active" : ""}`} onClick={() => setTab("assign")}>Assign tasks</button>
+        <button className={`lp-tab ${tab === "schedule" ? "is-active" : ""}`} onClick={() => setTab("schedule")}>Manager schedule</button>
         <button className={`lp-tab ${tab === "log" ? "is-active" : ""}`} onClick={() => setTab("log")}>Full log</button>
         <button className={`lp-tab ${tab === "sites" ? "is-active" : ""}`} onClick={() => setTab("sites")}>Sites &amp; people</button>
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
       {tab === "assign" && <AssignTasksPanel workers={workers} assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
+      {tab === "schedule" && <ManagerSchedulePanel managers={managers} currentManager={currentManager} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
       {tab === "sites" && <SitesPeoplePanel />}
       {tab === "settings" && <ManagerSettings workers={workers} settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
+    </div>
+  );
+}
+
+/* ---------------- Manager schedule ---------------- */
+function ManagerSchedulePanel({ managers, currentManager }) {
+  const defaultOwner = currentManager?.id
+    || managers.find((m) => m.name === "Shane Campbell")?.id
+    || managers[0]?.id
+    || "";
+  const [ownerId, setOwnerId] = useState(defaultOwner);
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [date, setDate] = useState(todayISO());
+  const [startTime, setStartTime] = useState("");
+  const [endTime, setEndTime] = useState("");
+  const [title, setTitle] = useState("");
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const isOwnSchedule = Boolean(currentManager) && ownerId === currentManager.id;
+  const ownerName = managers.find((m) => m.id === ownerId)?.name || "this manager";
+
+  const refresh = async (id) => setItems(await loadManagerSchedule(id));
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true);
+    loadManagerSchedule(ownerId).then((rows) => { if (live) { setItems(rows); setLoading(false); } });
+    return () => { live = false; };
+  }, [ownerId]);
+
+  async function addItem() {
+    if (!title.trim()) { setErr("Describe what's happening first."); return; }
+    if (Boolean(startTime) !== Boolean(endTime)) { setErr("Set both a start and a finish time, or neither."); return; }
+    if (startTime && startTime === endTime) { setErr("Start and finish can't be the same time."); return; }
+    setBusy(true); setErr("");
+    try {
+      await createScheduleItem({
+        id: uid(),
+        owner_id: ownerId,
+        date,
+        start_time: startTime || null,
+        end_time: endTime || null,
+        title: title.trim(),
+        notes: notes.trim() || null,
+        created_by: currentManager?.id || null,
+        // Anything another manager adds needs the owner's approval.
+        status: isOwnSchedule ? "confirmed" : "pending",
+      });
+      setTitle(""); setNotes(""); setStartTime(""); setEndTime("");
+      await refresh(ownerId);
+    } catch (e) {
+      setErr(e.message || "Couldn't save that — try again.");
+    }
+    setBusy(false);
+  }
+
+  async function decide(id, status) {
+    setErr("");
+    try {
+      await updateScheduleItem(id, { status, decided_at: new Date().toISOString() });
+      await refresh(ownerId);
+    } catch (e) { setErr(e.message || "Couldn't update that — try again."); }
+  }
+
+  async function removeItem(id) {
+    setErr("");
+    try {
+      await updateScheduleItem(id, { active: false });
+      await refresh(ownerId);
+    } catch (e) { setErr(e.message || "Couldn't remove that — try again."); }
+  }
+
+  const pending = items.filter((i) => i.status === "pending");
+  const agenda = items.filter((i) => i.status === "confirmed" && i.date >= todayISO());
+  const days = [];
+  agenda.forEach((i) => {
+    const day = days.find((d) => d.date === i.date);
+    if (day) day.items.push(i); else days.push({ date: i.date, items: [i] });
+  });
+
+  return (
+    <div className="lp-settings">
+      <h3><CalendarDays size={16} /> Manager schedule</h3>
+      <div className="lp-settings-row">
+        <span className="lp-staff-pin-label">Whose schedule</span>
+        <select className="lp-input lp-input--slim" value={ownerId} onChange={(e) => setOwnerId(e.target.value)}>
+          {managers.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+        </select>
+      </div>
+      <p className="lp-hint">
+        Every manager can see this. {isOwnSchedule
+          ? "Anything you add here is confirmed straight away."
+          : `Anything you add goes to ${ownerName} to approve first.`}
+      </p>
+      {err && <p className="lp-error">{err}</p>}
+
+      {pending.length > 0 && (
+        <>
+          <h4 className="lp-schedule-heading">
+            {isOwnSchedule ? "Awaiting your approval" : `Awaiting ${ownerName}'s approval`} ({pending.length})
+          </h4>
+          <div className="lp-person-list">
+            {pending.map((i) => (
+              <div className="lp-person-row" key={i.id}>
+                <div className="lp-person-head">
+                  <div>
+                    <strong>{i.title}</strong>
+                    <span className="lp-worker-type">{fmtShortDay(i.date)}{i.start_time ? ` · ${fmtTime12(i.start_time)}–${fmtTime12(i.end_time)}` : ""}</span>
+                  </div>
+                </div>
+                {i.notes && <p className="lp-hint lp-hint--muted">{i.notes}</p>}
+                <div className="lp-person-actions">
+                  {isOwnSchedule ? (
+                    <>
+                      <button className="lp-btn-ghost" onClick={() => decide(i.id, "confirmed")}><Check size={13} /> Approve</button>
+                      <button className="lp-btn-ghost lp-btn-danger" onClick={() => decide(i.id, "declined")}><X size={13} /> Decline</button>
+                    </>
+                  ) : (
+                    <button className="lp-btn-ghost lp-btn-danger" onClick={() => removeItem(i.id)}><Trash2 size={13} /> Withdraw</button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      <hr className="lp-settings-divider" />
+
+      <h4 className="lp-schedule-heading">{isOwnSchedule ? "Add to your schedule" : `Propose to ${ownerName}`}</h4>
+      <div className="lp-row2">
+        <Field label="Date"><input type="date" className="lp-input" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+        <Field label="What's happening"><input className="lp-input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Site Four walkthrough with the arborist" /></Field>
+      </div>
+      <div className="lp-row2">
+        <Field label="Start (optional)"><input type="time" className="lp-input" value={startTime} onChange={(e) => setStartTime(e.target.value)} /></Field>
+        <Field label="Finish (optional)"><input type="time" className="lp-input" value={endTime} onChange={(e) => setEndTime(e.target.value)} /></Field>
+      </div>
+      <Field label="Notes (optional)">
+        <textarea className="lp-textarea" rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
+      </Field>
+      <button className="lp-btn-ghost" onClick={addItem} disabled={busy}>
+        <Plus size={15} /> {busy ? "Saving…" : isOwnSchedule ? "Add to schedule" : "Send for approval"}
+      </button>
+
+      <hr className="lp-settings-divider" />
+
+      <h4 className="lp-schedule-heading">{ownerName}'s schedule from today</h4>
+      {loading ? (
+        <p className="lp-hint">Loading…</p>
+      ) : days.length === 0 ? (
+        <p className="lp-hint">Nothing scheduled.</p>
+      ) : (
+        days.map((day) => (
+          <div className="lp-schedule-day" key={day.date}>
+            <h5>{fmtDayHeading(day.date)}</h5>
+            <div className="lp-person-list">
+              {day.items.map((i) => (
+                <div className="lp-person-row" key={i.id}>
+                  <div className="lp-person-head">
+                    <div>
+                      <strong>{i.title}</strong>
+                      {i.start_time && <span className="lp-tag">{fmtTime12(i.start_time)}–{fmtTime12(i.end_time)}</span>}
+                    </div>
+                    {isOwnSchedule && (
+                      <button className="lp-btn-ghost lp-btn-danger" onClick={() => removeItem(i.id)}><Trash2 size={13} /> Remove</button>
+                    )}
+                  </div>
+                  {i.notes && <p className="lp-hint lp-hint--muted">{i.notes}</p>}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))
+      )}
     </div>
   );
 }
@@ -2075,6 +2301,9 @@ body{margin:0;}
 .lp-gate-default{margin-top:14px;}
 
 .lp-site-chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;}
+.lp-schedule-heading{font-family:'Fraunces',serif;font-size:14px;margin:16px 0 6px;}
+.lp-schedule-day{margin-top:12px;}
+.lp-schedule-day h5{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 6px;}
 .lp-site-code{font-family:'IBM Plex Mono',monospace;font-size:9.5px;opacity:.65;margin-left:3px;}
 .lp-person-list{display:flex;flex-direction:column;gap:10px;margin-top:10px;}
 .lp-person-row{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel);}
