@@ -227,18 +227,48 @@ function rowToReport(row) {
     submittedAt: row.submitted_at || "",
   };
 }
-function reportToRow(report, photos) {
+function reportToRow(report, photoPaths) {
   return {
     id: report.id, date: report.date, worker_name: report.workerName, worker_type: report.workerType,
     arrival: report.arrival, departure: report.departure, hours: report.hours, tasks: report.tasks,
     photo_count: report.photoCount, delays: report.delays, delay_explain: report.delayExplain,
     delay_notes: report.delayNotes, tomorrow: report.tomorrow, full_check: report.fullCheck,
-    submitted_at: report.submittedAt, site_id: report.siteId || null, photos: photos || [],
+    submitted_at: report.submittedAt, site_id: report.siteId || null,
+    photos: [], photo_paths: photoPaths || [],
   };
 }
 
+const PHOTO_BUCKET = "work-photos";
+
+function dataUrlToBlob(dataUrl) {
+  const [head, body] = dataUrl.split(",");
+  const type = /:(.*?);/.exec(head)?.[1] || "image/jpeg";
+  const bytes = atob(body);
+  const buf = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
+  return new Blob([buf], { type });
+}
+
+// site_id/date/report_id/ keeps a report's photos together and puts the site
+// first, which is what the storage policies check.
+async function uploadReportPhotos(report, photos) {
+  if (!photos?.length || !report.siteId) return [];
+  const folder = `${report.siteId}/${report.date}/${report.id}`;
+  const paths = [];
+  for (let i = 0; i < photos.length; i++) {
+    const blob = dataUrlToBlob(photos[i]);
+    const ext = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
+    const path = `${folder}/${String(i + 1).padStart(2, "0")}.${ext}`;
+    const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, blob, { contentType: blob.type, upsert: true });
+    if (error) throw new Error("Your photos couldn't be uploaded — check your signal and try again.");
+    paths.push(path);
+  }
+  return paths;
+}
+
 async function createReportInSupabase(report, photos) {
-  await supabaseFetch("/reports", { method: "POST", body: [reportToRow(report, photos)] });
+  const paths = await uploadReportPhotos(report, photos);
+  await supabaseFetch("/reports", { method: "POST", body: [reportToRow(report, paths)] });
 }
 
 async function loadIndex() {
@@ -254,15 +284,26 @@ async function loadMonth(ym) {
     const start = `${ym}-01`;
     const [y, m] = ym.split("-").map(Number);
     const nextMonth = new Date(y, m, 1).toISOString().slice(0, 10);
-    const rows = await supabaseFetch(`/reports?date=gte.${start}&date=lt.${nextMonth}&select=*`);
+    // Everything except the photo payload: the log fetches images only when a
+    // report is expanded, and legacy base64 rows are heavy to drag around.
+    const cols = "id,date,worker_name,worker_type,arrival,departure,hours,tasks,photo_count,delays,delay_explain,delay_notes,tomorrow,full_check,submitted_at,site_id";
+    const rows = await supabaseFetch(`/reports?date=gte.${start}&date=lt.${nextMonth}&select=${cols}`);
     return (rows || []).map(rowToReport);
   } catch { return []; }
 }
 
+// Photos come back as displayable URLs either way: signed links for anything
+// in Storage, and the original base64 for reports filed before the move.
 async function loadPhotos(reportId) {
   try {
-    const rows = await supabaseFetch(`/reports?id=eq.${reportId}&select=photos`);
-    return rows?.[0]?.photos || [];
+    const rows = await supabaseFetch(`/reports?id=eq.${reportId}&select=photos,photo_paths`);
+    const row = rows?.[0];
+    if (!row) return [];
+    const paths = row.photo_paths || [];
+    if (!paths.length) return row.photos || [];
+    const { data, error } = await supabase.storage.from(PHOTO_BUCKET).createSignedUrls(paths, 300);
+    if (error) return [];
+    return (data || []).map((d) => d.signedUrl).filter(Boolean);
   } catch { return []; }
 }
 
@@ -544,17 +585,38 @@ function roleLabel(role) {
 }
 
 async function deleteReportInSupabase(id) {
+  const rows = await supabaseFetch(`/reports?id=eq.${id}&select=photo_paths`).catch(() => []);
+  const paths = rows?.[0]?.photo_paths || [];
+  if (paths.length) await supabase.storage.from(PHOTO_BUCKET).remove(paths);
   await supabaseFetch(`/reports?id=eq.${id}`, { method: "DELETE" });
 }
 async function deactivateAssignedTaskInSupabase(id) {
   await supabaseFetch(`/assigned_tasks?id=eq.${id}`, { method: "PATCH", body: { active: false } });
 }
 
+// A backup has to survive the app disappearing, so stored photos are pulled
+// back down and embedded rather than referenced by path.
+async function downloadPhotosAsDataUrls(paths) {
+  const out = [];
+  for (const path of paths) {
+    const { data, error } = await supabase.storage.from(PHOTO_BUCKET).download(path);
+    if (error || !data) continue;
+    out.push(await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(String(reader.result));
+      reader.readAsDataURL(data);
+    }));
+  }
+  return out;
+}
+
 async function exportBackup() {
   const rows = await supabaseFetch("/reports?select=*").catch(() => []);
   const reports = (rows || []).map(rowToReport);
   const photosMap = {};
-  (rows || []).forEach((r) => { photosMap[r.id] = r.photos || []; });
+  for (const r of rows || []) {
+    photosMap[r.id] = (r.photo_paths || []).length ? await downloadPhotosAsDataUrls(r.photo_paths) : r.photos || [];
+  }
   const assignedTasks = await loadAssignedTasks();
   const backup = { app: "property-daily-reports", exportedAt: new Date().toISOString(), reports, assignedTasks, photos: photosMap };
   const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
