@@ -361,9 +361,11 @@ function expectedWindowLabel(task) {
   if (!task.startTime || !task.endTime) return "";
   return `${fmtTime12(task.startTime)}\u2013${fmtTime12(task.endTime)}`;
 }
+// The roster view carries names only. Staff can't read the people table
+// itself, so anything that just needs a list of names reads this instead.
 async function loadPeople() {
   try {
-    const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role,email&order=sort_order,name");
+    const rows = await supabaseFetch("/roster?active=eq.true&select=id,name,role&order=sort_order,name");
     return rows || [];
   } catch { return []; }
 }
@@ -1269,7 +1271,9 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
             )}
           </Field>
           <Field label="Site">
-            {siteOptions.length === 1 ? (
+            {siteOptions.length === 0 ? (
+              <p className="lp-hint">You're not assigned to a site yet — ask your manager before filing a report.</p>
+            ) : siteOptions.length === 1 ? (
               <div className="lp-locked-name"><Building2 size={13} /> {siteOptions[0].name}</div>
             ) : (
               <select className="lp-input" value={siteId} onChange={(e) => setSiteId(e.target.value)}>
