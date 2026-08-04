@@ -55,8 +55,10 @@ create table if not exists people (
   role       text not null default 'staff', -- manager | staff | contractor
   pin        text,
   active     boolean default true,
+  sort_order integer default 100, -- display order on the home screen
   created_at timestamptz default now()
 );
+alter table people add column if not exists sort_order integer default 100;
 
 -- Which sites a person can see.
 create table if not exists site_assignments (

@@ -30,7 +30,6 @@ const STAFF_NAMES = ["Brett", "Chris"];
 const DEFAULT_PIN = "2468";
 const OPEN_CONTRACTOR_SLOTS = ["Contractor One", "Contractor Two"];
 const DEFAULT_STAFF_PINS = { Brett: "1701", Chris: "2802", "Contractor One": "5501", "Contractor Two": "6602" };
-const ALL_PIN_NAMES = [...STAFF_NAMES, ...OPEN_CONTRACTOR_SLOTS];
 const OUTSTANDING_LOOKBACK_DAYS = 90;
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
@@ -376,7 +375,7 @@ async function loadSites() {
 
 async function loadPeople() {
   try {
-    const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role&order=name");
+    const rows = await supabaseFetch("/people?active=eq.true&select=id,name,role,pin&order=sort_order,name");
     return rows || [];
   } catch { return []; }
 }
@@ -396,6 +395,10 @@ async function savePersonSites(personId, siteIds) {
     method: "POST",
     body: siteIds.map((siteId) => ({ person_id: personId, site_id: siteId })),
   });
+}
+
+async function savePersonPin(personId, pin) {
+  await supabaseFetch(`/people?id=eq.${personId}`, { method: "PATCH", body: { pin } });
 }
 
 function roleLabel(role) {
@@ -454,14 +457,16 @@ export default function App() {
   const [pendingStaff, setPendingStaff] = useState("");
   const [cacheVersion, setCacheVersion] = useState(0);
   const [assignedTasks, setAssignedTasks] = useState([]);
+  const [people, setPeople] = useState([]);
   const cacheRef = useRef({});
 
   useEffect(() => {
     (async () => {
-      const [idx, s, at] = await Promise.all([loadIndex(), loadSettings(), loadAssignedTasks()]);
+      const [idx, s, at, ppl] = await Promise.all([loadIndex(), loadSettings(), loadAssignedTasks(), loadPeople()]);
       setMonthsIndex(idx);
       setSettings(s);
       setAssignedTasks(at);
+      setPeople(ppl);
       const ym = monthOf(todayISO());
       cacheRef.current[ym] = await loadMonth(ym);
       setLoading(false);
@@ -522,6 +527,21 @@ export default function App() {
     setAssignedTasks(await loadAssignedTasks());
   }
 
+  // People come from the database; fall back to the original hardcoded list
+  // so the app still works if that table can't be read.
+  const workers = people.length
+    ? people.filter((p) => p.role !== "manager")
+    : [...STAFF_NAMES.map((name) => ({ id: name, name, role: "staff" })),
+       ...OPEN_CONTRACTOR_SLOTS.map((name) => ({ id: name, name, role: "contractor" }))];
+  const managerPins = people.filter((p) => p.role === "manager").map((p) => p.pin).filter(Boolean);
+
+  function pinFor(name) {
+    return people.find((p) => p.name === name)?.pin || settings.staffPins?.[name] || "";
+  }
+  function isSharedSlot(name) {
+    return OPEN_CONTRACTOR_SLOTS.includes(name);
+  }
+
   async function handleRestored() {
     cacheRef.current = {};
     const idx = await loadIndex();
@@ -539,8 +559,9 @@ export default function App() {
         <div className="lp-loading"><Sun size={22} /><span>Loading Property Daily Reports…</span></div>
       ) : view === "home" ? (
         <Home
+          workers={workers}
           onWorker={(name) => {
-            if (name && settings.staffPins?.[name]) { setPendingStaff(name); setView("staffGate"); }
+            if (name && pinFor(name)) { setPendingStaff(name); setView("staffGate"); }
             else { setPresetName(name); setView("form"); }
           }}
           onManager={() => setView(managerAuthed ? "manager" : "managerGate")}
@@ -548,16 +569,17 @@ export default function App() {
       ) : view === "staffGate" ? (
         <StaffGate
           staffName={pendingStaff}
-          pin={settings.staffPins?.[pendingStaff]}
+          pin={pinFor(pendingStaff)}
           onBack={() => setView("home")}
           onSuccess={() => {
-            setPresetName(STAFF_NAMES.includes(pendingStaff) ? pendingStaff : "");
+            setPresetName(isSharedSlot(pendingStaff) ? "" : pendingStaff);
             setView("form");
           }}
         />
       ) : view === "form" ? (
         <WorkerForm
           presetName={presetName}
+          workerNames={workers.map((w) => w.name)}
           assignedTasks={assignedTasks}
           onAcknowledge={acknowledgeAssignedTask}
           onBack={() => setView("home")}
@@ -566,9 +588,10 @@ export default function App() {
       ) : view === "submitted" ? (
         <SubmittedScreen onHome={() => setView("home")} />
       ) : view === "managerGate" ? (
-        <ManagerGate pin={settings.managerPin} onBack={() => setView("home")} onSuccess={() => { setManagerAuthed(true); setView("manager"); }} />
+        <ManagerGate pin={settings.managerPin} extraPins={managerPins} onBack={() => setView("home")} onSuccess={() => { setManagerAuthed(true); setView("manager"); }} />
       ) : (
         <ManagerDashboard
+          workers={workers}
           monthsIndex={monthsIndex}
           getMonths={getMonths}
           refreshMonths={refreshMonths}
@@ -589,7 +612,7 @@ export default function App() {
 }
 
 /* ---------------- Home ---------------- */
-function Home({ onWorker, onManager }) {
+function Home({ workers, onWorker, onManager }) {
   const today = new Date();
   return (
     <div className="lp-home">
@@ -607,20 +630,22 @@ function Home({ onWorker, onManager }) {
       <div className="lp-staff-section">
         <span className="lp-eyebrow">Submit Daily Report</span>
         <div className="lp-staff-grid">
-          {STAFF_NAMES.map((name) => (
-            <button className="lp-staff-card" key={name} onClick={() => onWorker(name)}>
-              <span className="lp-staff-initial">{name[0]}</span>
-              <span className="lp-staff-name">{name}</span>
-              <ChevronRight size={17} className="lp-chev" />
-            </button>
-          ))}
-          {OPEN_CONTRACTOR_SLOTS.map((slot) => (
-            <button className="lp-staff-card lp-staff-card--other" key={slot} onClick={() => onWorker(slot)}>
-              <span className="lp-staff-initial lp-staff-initial--other">+</span>
-              <span className="lp-staff-name">{slot}</span>
-              <ChevronRight size={17} className="lp-chev" />
-            </button>
-          ))}
+          {workers.map((person) => {
+            const contractor = person.role === "contractor";
+            return (
+              <button
+                className={`lp-staff-card ${contractor ? "lp-staff-card--other" : ""}`}
+                key={person.id}
+                onClick={() => onWorker(person.name)}
+              >
+                <span className={`lp-staff-initial ${contractor ? "lp-staff-initial--other" : ""}`}>
+                  {person.name[0]}
+                </span>
+                <span className="lp-staff-name">{person.name}</span>
+                <ChevronRight size={17} className="lp-chev" />
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -636,10 +661,10 @@ function Home({ onWorker, onManager }) {
 }
 
 /* ---------------- Worker Form ---------------- */
-function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks, onAcknowledge }) {
+function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge }) {
   const [workerType, setWorkerType] = useState("");
   const [workerName, setWorkerName] = useState(presetName || "");
-  const nameLocked = STAFF_NAMES.includes(presetName);
+  const nameLocked = Boolean(presetName);
   const [date, setDate] = useState(todayISO());
   const [arrival, setArrival] = useState("");
   const [departure, setDeparture] = useState("");
@@ -827,7 +852,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks, onAcknowle
           )}
           <Field label="How many separate tasks did you complete today?"><ChoiceRow options={TASK_COUNT_OPTIONS} value={taskCountChoice} onChange={setTaskCount} /></Field>
           {tasks.map((t, i) => (
-            <TaskBlock key={t.id} index={i} task={t} workerName={workerName} onChange={(patch) => updateTask(t.id, patch)} onRemove={tasks.length > 1 ? () => removeTask(t.id) : null} />
+            <TaskBlock key={t.id} index={i} task={t} workerName={workerName} workerNames={workerNames} onChange={(patch) => updateTask(t.id, patch)} onRemove={tasks.length > 1 ? () => removeTask(t.id) : null} />
           ))}
           {taskCountChoice === "5+" && (
             tasks.length < MAX_TASKS ? (
@@ -894,10 +919,13 @@ function WorkerForm({ onBack, onSubmitted, presetName, assignedTasks, onAcknowle
   );
 }
 
-function TaskBlock({ index, task, workerName, onChange, onRemove }) {
+function TaskBlock({ index, task, workerName, workerNames, onChange, onRemove }) {
   const [open, setOpen] = useState(true);
   const label = task.workType && task.area ? `${task.workType} — ${task.area}` : `Task ${index + 1}`;
-  const jointOptions = [...STAFF_NAMES.filter((n) => n.toLowerCase() !== (workerName || "").trim().toLowerCase()), "Manager"];
+  const jointOptions = [
+    ...workerNames.filter((n) => n.toLowerCase() !== (workerName || "").trim().toLowerCase()),
+    "Manager",
+  ];
   function toggleJoint(name) {
     const set = new Set(task.jointWith || []);
     if (set.has(name)) set.delete(name); else set.add(name);
@@ -1040,11 +1068,12 @@ function StaffGate({ staffName, pin, onBack, onSuccess }) {
 }
 
 /* ---------------- Manager gate ---------------- */
-function ManagerGate({ pin, onBack, onSuccess }) {
+function ManagerGate({ pin, extraPins = [], onBack, onSuccess }) {
   const [value, setValue] = useState("");
   const [err, setErr] = useState("");
+  const accepted = [pin, ...extraPins].filter(Boolean).map((p) => String(p).trim());
   function submit() {
-    if (value.trim() === String(pin || "").trim()) onSuccess();
+    if (accepted.includes(value.trim())) onSuccess();
     else { setErr("Incorrect PIN."); setValue(""); }
   }
   return (
@@ -1071,7 +1100,7 @@ function ManagerGate({ pin, onBack, onSuccess }) {
 }
 
 /* ---------------- Manager dashboard ---------------- */
-function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onDeleteReport, onRestored, onExit }) {
+function ManagerDashboard({ workers, monthsIndex, getMonths, refreshMonths, cacheVersion, settings, onSettingsChange, assignedTasks, onAddAssignedTask, onRemoveAssignedTask, onUpdateAssignedTask, onDeleteReport, onRestored, onExit }) {
   const [tab, setTab] = useState("brief");
   return (
     <div className="lp-page lp-page--manager">
@@ -1084,16 +1113,16 @@ function ManagerDashboard({ monthsIndex, getMonths, refreshMonths, cacheVersion,
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
-      {tab === "assign" && <AssignTasksPanel assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
+      {tab === "assign" && <AssignTasksPanel workers={workers} assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
       {tab === "log" && <FullLog monthsIndex={monthsIndex} getMonths={getMonths} cacheVersion={cacheVersion} onDeleteReport={onDeleteReport} />}
       {tab === "sites" && <SitesPeoplePanel />}
-      {tab === "settings" && <ManagerSettings settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
+      {tab === "settings" && <ManagerSettings workers={workers} settings={settings} onChange={onSettingsChange} onRestored={onRestored} />}
     </div>
   );
 }
 
-function AssignedTaskRow({ task, onRemove, onUpdate }) {
-  const NAME_OPTIONS = [...STAFF_NAMES, ...OPEN_CONTRACTOR_SLOTS];
+function AssignedTaskRow({ task, onRemove, onUpdate, nameOptions }) {
+  const NAME_OPTIONS = nameOptions;
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(false);
@@ -1218,8 +1247,8 @@ function AssignedTaskRow({ task, onRemove, onUpdate }) {
   );
 }
 
-function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
-  const NAME_OPTIONS = [...STAFF_NAMES, ...OPEN_CONTRACTOR_SLOTS];
+function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate, workers }) {
+  const NAME_OPTIONS = workers.map((w) => w.name);
   const [date, setDate] = useState(todayISO());
   const [isAnyone, setIsAnyone] = useState(true);
   const [selectedNames, setSelectedNames] = useState([]);
@@ -1361,7 +1390,7 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
             <EmptyState compact icon={<Check size={16} />} text="Nothing assigned for this day." />
           ) : (
             <ul className="lp-assigned-list">
-              {tasksByDate.get(selectedDay).map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} onUpdate={onUpdate} />)}
+              {tasksByDate.get(selectedDay).map((t) => <AssignedTaskRow key={t.id} task={t} nameOptions={NAME_OPTIONS} onRemove={onRemove} onUpdate={onUpdate} />)}
             </ul>
           )}
         </div>
@@ -1381,7 +1410,7 @@ function AssignTasksPanel({ assignedTasks, onAdd, onRemove, onUpdate }) {
                   <span className="lp-hint">{acked}/{group.tasks.length} acknowledged</span>
                 </div>
                 <ul className="lp-assigned-list">
-                  {group.tasks.map((t) => <AssignedTaskRow key={t.id} task={t} onRemove={onRemove} onUpdate={onUpdate} />)}
+                  {group.tasks.map((t) => <AssignedTaskRow key={t.id} task={t} nameOptions={NAME_OPTIONS} onRemove={onRemove} onUpdate={onUpdate} />)}
                 </ul>
               </div>
             );
@@ -1739,7 +1768,9 @@ function SitesPeoplePanel() {
       <h3><Building2 size={16} /> Sites</h3>
       <p className="lp-hint">{sites.length} site{sites.length === 1 ? "" : "s"}. Names and addresses can be updated later.</p>
       <div className="lp-site-chips">
-        {sites.map((s) => <span className="lp-tag" key={s.id}>{s.name}</span>)}
+        {sites.map((s) => (
+          <span className="lp-tag" key={s.id}>{s.name} <code className="lp-site-code">{s.id.toUpperCase()}</code></span>
+        ))}
       </div>
 
       <hr className="lp-settings-divider" />
@@ -1806,17 +1837,31 @@ function SitesPeoplePanel() {
   );
 }
 
-function ManagerSettings({ settings, onChange, onRestored }) {
+function ManagerSettings({ workers, settings, onChange, onRestored }) {
   const [pin, setPin] = useState(settings.managerPin || DEFAULT_PIN);
   const [saved, setSaved] = useState(false);
-  const [staffPins, setStaffPins] = useState({ ...DEFAULT_STAFF_PINS, ...(settings.staffPins || {}) });
+  const [staffPins, setStaffPins] = useState({}); // person id -> edited pin
   const [staffSaved, setStaffSaved] = useState(false);
+  const [pinSaving, setPinSaving] = useState(false);
+  const [pinError, setPinError] = useState("");
   const [exporting, setExporting] = useState(false);
   const [exportErr, setExportErr] = useState("");
   const [restoring, setRestoring] = useState(false);
   const [restoreMsg, setRestoreMsg] = useState("");
   const [restoreErr, setRestoreErr] = useState("");
   const [confirmRestore, setConfirmRestore] = useState(false);
+
+  async function saveStaffPins() {
+    setPinSaving(true); setPinError(""); setStaffSaved(false);
+    try {
+      const edited = Object.entries(staffPins).filter(([id, v]) => v !== workers.find((w) => w.id === id)?.pin);
+      await Promise.all(edited.map(([id, v]) => savePersonPin(id, v)));
+      setStaffSaved(true);
+    } catch (e) {
+      setPinError(e.message || "Couldn't save those PINs — try again.");
+    }
+    setPinSaving(false);
+  }
 
   async function handleExport() {
     setExporting(true); setExportErr("");
@@ -1847,21 +1892,22 @@ function ManagerSettings({ settings, onChange, onRestored }) {
       <hr className="lp-settings-divider" />
 
       <h3><Lock size={16} /> Staff PINs</h3>
-      <p className="lp-hint">Each PIN unlocks that "Submit Daily Report" button. Brett and Chris are locked to their own name; Contractor One and Contractor Two are shared entry points — the PIN keeps them restricted to whoever you give it to, but they still type in their own name once inside.</p>
+      <p className="lp-hint">Each PIN unlocks that person's "Submit Daily Report" button. Named staff are locked to their own name; Contractor One and Contractor Two are shared entry points — the PIN keeps them restricted to whoever you give it to, but they still type in their own name once inside.</p>
       <div className="lp-staff-pin-list">
-        {ALL_PIN_NAMES.map((name) => (
-          <div className="lp-settings-row" key={name}>
-            <span className="lp-staff-pin-label">{name}</span>
+        {workers.map((person) => (
+          <div className="lp-settings-row" key={person.id}>
+            <span className="lp-staff-pin-label">{person.name}</span>
             <input
               className="lp-input lp-input--slim" inputMode="numeric"
-              value={staffPins[name] || ""}
-              onChange={(e) => { setStaffPins((p) => ({ ...p, [name]: e.target.value })); setStaffSaved(false); }}
+              value={staffPins[person.id] ?? person.pin ?? ""}
+              onChange={(e) => { setStaffPins((p) => ({ ...p, [person.id]: e.target.value })); setStaffSaved(false); }}
             />
           </div>
         ))}
-        <button className="lp-btn-ghost" onClick={() => { onChange({ ...settings, staffPins }); setStaffSaved(true); }}>Save PINs</button>
+        <button className="lp-btn-ghost" onClick={saveStaffPins} disabled={pinSaving}>{pinSaving ? "Saving…" : "Save PINs"}</button>
       </div>
-      {staffSaved && <p className="lp-saved"><Check size={13} /> Saved</p>}
+      {pinError && <p className="lp-error">{pinError}</p>}
+      {staffSaved && <p className="lp-saved"><Check size={13} /> Saved — reload the app for new PINs to take effect.</p>}
 
       <hr className="lp-settings-divider" />
 
@@ -2029,6 +2075,7 @@ body{margin:0;}
 .lp-gate-default{margin-top:14px;}
 
 .lp-site-chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;}
+.lp-site-code{font-family:'IBM Plex Mono',monospace;font-size:9.5px;opacity:.65;margin-left:3px;}
 .lp-person-list{display:flex;flex-direction:column;gap:10px;margin-top:10px;}
 .lp-person-row{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel);}
 .lp-person-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;}
