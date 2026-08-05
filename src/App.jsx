@@ -3,7 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import {
   Check, X, AlertTriangle, Clock, Camera, Lock, ChevronRight,
   ChevronDown, ChevronLeft, Plus, Trash2, ArrowLeft, Sun, ClipboardList, Settings,
-  CalendarDays, ImageOff, ShieldCheck, LogOut, Search, Building2, Users
+  CalendarDays, ImageOff, ShieldCheck, LogOut, Search, Building2, Users, Pencil
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -25,7 +25,6 @@ const WORKTYPE_OPTIONS = [
   "Mulching", "Property Repair", "Cleaning", "Machinery", "Materials Collection", "Other",
 ];
 const STATUS_OPTIONS = ["Complete", "Ongoing", "Waiting on materials", "Waiting on instruction"];
-const TASK_COUNT_OPTIONS = ["1", "2", "3", "4", "5+"];
 const MAX_TASKS = 12;
 const STAFF_NAMES = ["Brett", "Chris"];
 const OPEN_CONTRACTOR_SLOTS = ["Contractor One", "Contractor Two"];
@@ -258,7 +257,9 @@ async function uploadReportPhotos(report, photos) {
   for (let i = 0; i < photos.length; i++) {
     const blob = dataUrlToBlob(photos[i]);
     const ext = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
-    const path = `${folder}/${String(i + 1).padStart(2, "0")}.${ext}`;
+    // Unique name rather than a running number: photos are added and removed
+    // across a day's edits, so an index would eventually collide.
+    const path = `${folder}/${uid()}.${ext}`;
     const { error } = await supabase.storage.from(PHOTO_BUCKET).upload(path, blob, { contentType: blob.type, upsert: true });
     if (error) throw new Error("Your photos couldn't be uploaded — check your signal and try again.");
     paths.push(path);
@@ -269,6 +270,26 @@ async function uploadReportPhotos(report, photos) {
 async function createReportInSupabase(report, photos) {
   const paths = await uploadReportPhotos(report, photos);
   await supabaseFetch("/reports", { method: "POST", body: [reportToRow(report, paths)] });
+}
+
+// Editing a report keeps the photos the worker left alone, drops the ones they
+// removed, and adds whatever they took since.
+async function updateReportInSupabase(report, newPhotos, keptPaths, removedPaths) {
+  if (removedPaths?.length) await supabase.storage.from(PHOTO_BUCKET).remove(removedPaths);
+  const added = await uploadReportPhotos(report, newPhotos);
+  const row = reportToRow(report, [...(keptPaths || []), ...added]);
+  delete row.id;
+  await supabaseFetch(`/reports?id=eq.${report.id}`, { method: "PATCH", body: row });
+}
+
+// A worker's own reports for the days they're still allowed to change.
+async function loadEditableReports(workerName, fromDate) {
+  try {
+    const rows = await supabaseFetch(
+      `/reports?worker_name=eq.${encodeURIComponent(workerName)}&date=gte.${fromDate}&select=id,date,worker_name,worker_type,arrival,departure,hours,tasks,photo_count,delays,delay_explain,delay_notes,tomorrow,full_check,submitted_at,site_id,photo_paths&order=date.desc`
+    );
+    return (rows || []).map((row) => ({ ...rowToReport(row), photoPaths: row.photo_paths || [] }));
+  } catch { return []; }
 }
 
 async function loadIndex() {
@@ -795,7 +816,8 @@ export default function App() {
 
 function AppShell() {
   const { ready, session, person, isManager, signOut } = useAuth();
-  const [view, setView] = useState("form"); // form | submitted | account
+  const [view, setView] = useState("form"); // form | submitted | account | edit
+  const [editReport, setEditReport] = useState(null);
   const [monthsIndex, setMonthsIndex] = useState([]);
   const [loading, setLoading] = useState(true);
   const [cacheVersion, setCacheVersion] = useState(0);
@@ -830,9 +852,10 @@ function AppShell() {
     setCacheVersion((v) => v + 1);
   }
 
-  async function addReport(report, photos) {
+  async function saveReport(report, photos, edit) {
     const ym = monthOf(report.date);
-    await createReportInSupabase(report, photos);
+    if (edit) await updateReportInSupabase(report, photos, edit.keptPaths, edit.removedPaths);
+    else await createReportInSupabase(report, photos);
     cacheRef.current[ym] = await loadMonth(ym);
     if (!monthsIndex.includes(ym)) {
       const nextIndex = [...monthsIndex, ym].sort().reverse();
@@ -928,7 +951,7 @@ function AppShell() {
           cacheVersion={cacheVersion}
           assignedTasks={assignedTasks}
           onAcknowledgeAssignedTask={acknowledgeAssignedTask}
-          onAddReport={addReport}
+          onAddReport={saveReport}
           onDeleteReport={deleteReport}
           onUpdateAssignedTask={updateAssignedTask}
           onAddAssignedTask={addAssignedTask}
@@ -937,12 +960,26 @@ function AppShell() {
           onExit={signOut}
         />
       ) : view === "submitted" ? (
-        <SubmittedScreen onHome={() => setView("form")} />
+        <SubmittedScreen edited={Boolean(editReport)} onHome={() => { setEditReport(null); setView("form"); }} />
       ) : view === "account" ? (
         <div className="lp-page">
           <TopBar title="Your account" onBack={() => setView("form")} />
           <AccountPanel />
         </div>
+      ) : view === "edit" && editReport ? (
+        <WorkerForm
+          key={editReport.id}
+          presetName={person.name}
+          worker={person}
+          workerNames={workers.map((w) => w.name)}
+          assignedTasks={assignedTasks}
+          onAcknowledge={acknowledgeAssignedTask}
+          onBack={() => { setEditReport(null); setView("form"); }}
+          backLabel="Back"
+          onAccount={() => setView("account")}
+          editReport={editReport}
+          onSubmitted={async (report, photos, edit) => { await saveReport(report, photos, edit); setView("submitted"); }}
+        />
       ) : (
         <WorkerForm
           presetName={person.name}
@@ -953,9 +990,57 @@ function AppShell() {
           onBack={signOut}
           backLabel="Sign out"
           onAccount={() => setView("account")}
-          onSubmitted={async (report, photos) => { await addReport(report, photos); setView("submitted"); }}
+          recent={<EditableReports
+            workerName={person.name}
+            reloadKey={cacheVersion}
+            onEdit={(r) => { setEditReport(r); setView("edit"); }}
+          />}
+          onSubmitted={async (report, photos) => { await saveReport(report, photos, null); setView("submitted"); }}
         />
       )}
+    </div>
+  );
+}
+
+// A day's work isn't one moment at 4pm: a report can be reopened and added to
+// while it's still fresh. Yesterday stays open for late finishes; older
+// reports are the manager's record and are left alone.
+const EDIT_WINDOW_DAYS = 1;
+
+function EditableReports({ workerName, reloadKey, onEdit }) {
+  const [reports, setReports] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const from = addDays(todayISO(), -EDIT_WINDOW_DAYS);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    loadEditableReports(workerName, from).then((rows) => {
+      if (!cancelled) { setReports(rows); setLoading(false); }
+    });
+    return () => { cancelled = true; };
+  }, [workerName, from, reloadKey]);
+
+  if (loading || !reports.length) return null;
+
+  return (
+    <div className="lp-panel lp-my-tasks">
+      <div className="lp-assigned-day-head">
+        <h4><ClipboardList size={15} /> Your recent reports</h4>
+      </div>
+      <p className="lp-hint">Add tasks as the day goes — today and yesterday can still be changed.</p>
+      <ul className="lp-assigned-list">
+        {reports.map((r) => (
+          <li key={r.id} className="lp-assigned-item">
+            <div>
+              <strong>{r.date === todayISO() ? "Today" : "Yesterday"}</strong>
+              <span className="lp-hint"> · {r.tasks.length} task{r.tasks.length === 1 ? "" : "s"} · {r.hours} hrs</span>
+            </div>
+            <button type="button" className="lp-btn-ghost" onClick={() => onEdit(r)}><Pencil size={13} /> Open and edit</button>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -1156,30 +1241,46 @@ function AccountPanel() {
 }
 
 /* ---------------- Worker Form ---------------- */
-function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, worker = null, embedded = false, requirePhotos = true, backLabel, onAccount }) {
-  const [workerType, setWorkerType] = useState("");
-  const [workerName, setWorkerName] = useState(presetName || "");
-  const [siteId, setSiteId] = useState("");
+function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTasks, onAcknowledge, worker = null, embedded = false, requirePhotos = true, backLabel, onAccount, editReport = null, recent = null }) {
+  const editing = Boolean(editReport);
+  // Editing reopens a day that's already been filed, so every field starts
+  // from what was saved rather than blank.
+  const [workerType, setWorkerType] = useState(editReport?.workerType || "");
+  const [workerName, setWorkerName] = useState(editReport?.workerName || presetName || "");
+  const [siteId, setSiteId] = useState(editReport?.siteId || "");
   const [siteOptions, setSiteOptions] = useState([]);
   const nameLocked = Boolean(presetName);
-  const [date, setDate] = useState(todayISO());
-  const [arrival, setArrival] = useState("");
-  const [departure, setDeparture] = useState("");
-  const [taskCountChoice, setTaskCountChoice] = useState("");
-  const [tasks, setTasks] = useState([emptyTask()]);
+  const [date, setDate] = useState(editReport?.date || todayISO());
+  const [arrival, setArrival] = useState(editReport?.arrival || "");
+  const [departure, setDeparture] = useState(editReport?.departure || "");
+  const [tasks, setTasks] = useState(() =>
+    editReport?.tasks?.length ? editReport.tasks.map((t) => ({ ...emptyTask(), ...t, minutes: String(t.minutes ?? "") })) : [emptyTask()]
+  );
   const [addedAssignedIds, setAddedAssignedIds] = useState([]);
   const [ackBusy, setAckBusy] = useState(null);
   const [ackError, setAckError] = useState("");
   const [photos, setPhotos] = useState([]);
+  const [keptPaths, setKeptPaths] = useState(editReport?.photoPaths || []);
+  const [keptUrls, setKeptUrls] = useState([]);
+  const [removedPaths, setRemovedPaths] = useState([]);
   const [photoError, setPhotoError] = useState("");
-  const [delays, setDelays] = useState("");
-  const [delayExplain, setDelayExplain] = useState("");
-  const [delayNotes, setDelayNotes] = useState("");
-  const [tomorrow, setTomorrow] = useState("");
-  const [fullCheck, setFullCheck] = useState("");
+  const [delays, setDelays] = useState(editReport?.delays || "");
+  const [delayExplain, setDelayExplain] = useState(editReport?.delayExplain || "");
+  const [delayNotes, setDelayNotes] = useState(editReport?.delayNotes || "");
+  const [tomorrow, setTomorrow] = useState(editReport?.tomorrow || "");
+  const [fullCheck, setFullCheck] = useState(editReport?.fullCheck || "");
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!keptPaths.length) { setKeptUrls([]); return; }
+    supabase.storage.from(PHOTO_BUCKET).createSignedUrls(keptPaths, 300).then(({ data }) => {
+      if (!cancelled) setKeptUrls((data || []).map((d) => d.signedUrl));
+    });
+    return () => { cancelled = true; };
+  }, [keptPaths]);
 
   // A worker picks from the sites they're assigned to; managers filing their
   // own report, and anyone with no assignments yet, get the full list rather
@@ -1220,6 +1321,8 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
     finally { setAckBusy(null); }
   }
 
+  function addTask() { setTasks((prev) => (prev.length < MAX_TASKS ? [...prev, emptyTask()] : prev)); }
+
   function pullInAssignedTask(task) {
     if (addedAssignedIds.includes(task.id) || tasks.length >= MAX_TASKS) return;
     setTasks((prev) => {
@@ -1230,30 +1333,23 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
       return [...base, { ...emptyTask(), description: task.text, minutes: expectedMinutes, fromAssignedId: task.id }];
     });
     setAddedAssignedIds((prev) => [...prev, task.id]);
-    setTaskCountChoice("5+");
-  }
-
-  function setTaskCount(choice) {
-    setTaskCountChoice(choice);
-    const n = choice === "5+" ? 5 : parseInt(choice, 10);
-    setTasks((prev) => {
-      const next = [...prev];
-      while (next.length < n) next.push(emptyTask());
-      return next.slice(0, choice === "5+" ? Math.max(n, next.length) : n);
-    });
   }
   function updateTask(id, patch) { setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t))); }
   function removeTask(id) { setTasks((prev) => (prev.length > 1 ? prev.filter((t) => t.id !== id) : prev)); }
 
   async function handlePhotoFiles(fileList) {
     setPhotoError("");
-    const files = Array.from(fileList).slice(0, 6 - photos.length);
+    const files = Array.from(fileList).slice(0, 6 - photos.length - keptPaths.length);
     try {
       const compressed = await Promise.all(files.map((f) => compressImage(f)));
       setPhotos((prev) => [...prev, ...compressed].slice(0, 6));
     } catch { setPhotoError("One of those photos couldn't be processed — try again."); }
   }
   function removePhoto(idx) { setPhotos((prev) => prev.filter((_, i) => i !== idx)); }
+  function removeKeptPhoto(path) {
+    setKeptPaths((prev) => prev.filter((p) => p !== path));
+    setRemovedPaths((prev) => [...prev, path]);
+  }
 
   function validate() {
     if (!workerType) return "Select whether you're a full-time employee or subcontractor.";
@@ -1261,7 +1357,6 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
     if (!siteId) return "Choose the site you worked on.";
     if (!date) return "Enter today's date.";
     if (!arrival || !departure) return "Enter arrival and departure time.";
-    if (!taskCountChoice) return "Select how many tasks you completed.";
     for (const [i, t] of tasks.entries()) {
       if (!t.area || (t.area === "Other" && !t.areaOther.trim())) return `Task ${i + 1}: select an area.`;
       if (!t.workType || (t.workType === "Other" && !t.workTypeOther.trim())) return `Task ${i + 1}: select a work type.`;
@@ -1272,7 +1367,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
         if ((!t.jointWith || t.jointWith.length === 0) && !hasOther) return `Task ${i + 1}: tick who you worked with.`;
       }
     }
-    if (requirePhotos && photos.length < 3) return "Upload at least 3 photos.";
+    if (requirePhotos && photos.length + keptPaths.length < 3) return "Upload at least 3 photos.";
     if (!delays) return "Select whether anything delayed today's work.";
     if (delays === "Yes" && !delayExplain.trim()) return "Explain what caused the delay.";
     if (!tomorrow.trim()) return "Enter what should be completed tomorrow.";
@@ -1287,7 +1382,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
     setError("");
     setSubmitting(true);
     const report = {
-      id: uid(), workerType, workerName: workerName.trim(), siteId, date, arrival, departure,
+      id: editReport?.id || uid(), workerType, workerName: workerName.trim(), siteId, date, arrival, departure,
       hours: hoursBetween(arrival, departure),
       tasks: tasks.map((t) => ({
         ...t,
@@ -1298,12 +1393,13 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
           ? [...(t.jointWith || []), ...(t.jointWithOtherOn && t.jointWithOther.trim() ? [t.jointWithOther.trim()] : [])]
           : [],
       })),
-      photoCount: photos.length,
+      photoCount: photos.length + keptPaths.length,
       delays, delayExplain: delays === "Yes" ? delayExplain.trim() : "", delayNotes: delays === "Yes" ? delayNotes.trim() : "",
-      tomorrow: tomorrow.trim(), fullCheck, confirmed: true, submittedAt: new Date().toISOString(),
+      tomorrow: tomorrow.trim(), fullCheck, confirmed: true,
+      submittedAt: editReport?.submittedAt || new Date().toISOString(),
     };
     try {
-      await onSubmitted(report, photos);
+      await onSubmitted(report, photos, editing ? { keptPaths, removedPaths } : null);
     } catch (e) {
       setError(e.message || "Couldn't save your report — check your connection and try again. Your answers haven't been lost.");
     } finally {
@@ -1323,6 +1419,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
       )}
       <div className="lp-form">
         {worker && <StaffTasksPanel person={worker} />}
+        {recent}
         <Section n="1" title="About today">
           <Field label="Worker type"><ChoiceRow options={["Full-time Employee", "Subcontractor"]} value={workerType} onChange={setWorkerType} /></Field>
           <Field label="Your name">
@@ -1385,28 +1482,31 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
               {ackError && <p className="lp-error">{ackError}</p>}
             </div>
           )}
-          <Field label="How many separate tasks did you complete today?"><ChoiceRow options={TASK_COUNT_OPTIONS} value={taskCountChoice} onChange={setTaskCount} /></Field>
           {tasks.map((t, i) => (
             <TaskBlock key={t.id} index={i} task={t} workerName={workerName} workerNames={workerNames} onChange={(patch) => updateTask(t.id, patch)} onRemove={tasks.length > 1 ? () => removeTask(t.id) : null} />
           ))}
-          {taskCountChoice === "5+" && (
-            tasks.length < MAX_TASKS ? (
-              <button type="button" className="lp-btn-ghost" onClick={() => setTasks((p) => [...p, emptyTask()])}><Plus size={16} /> Add another task</button>
-            ) : (
-              <p className="lp-hint">Maximum of {MAX_TASKS} tasks per day reached.</p>
-            )
+          {tasks.length < MAX_TASKS ? (
+            <button type="button" className="lp-btn-ghost" onClick={addTask}><Plus size={16} /> Add another task</button>
+          ) : (
+            <p className="lp-hint">Maximum of {MAX_TASKS} tasks per day reached.</p>
           )}
         </Section>
 
         <Section n="3" title="Photos" hint={requirePhotos ? "Upload at least 3 photos of today's work" : "Optional — add photos if they're useful"}>
           <div className="lp-photo-grid">
+            {keptUrls.map((url, idx) => (
+              <div className="lp-photo-thumb" key={keptPaths[idx]}>
+                <img src={url} alt={`Work photo ${idx + 1}`} />
+                <button type="button" className="lp-photo-remove" onClick={() => removeKeptPhoto(keptPaths[idx])} aria-label="Remove photo"><X size={13} /></button>
+              </div>
+            ))}
             {photos.map((p, idx) => (
               <div className="lp-photo-thumb" key={idx}>
                 <img src={p} alt={`Work photo ${idx + 1}`} />
                 <button type="button" className="lp-photo-remove" onClick={() => removePhoto(idx)} aria-label="Remove photo"><X size={13} /></button>
               </div>
             ))}
-            {photos.length < 6 && (
+            {photos.length + keptPaths.length < 6 && (
               <label className="lp-photo-add">
                 <Camera size={20} /><span>Add photo</span>
                 <input
@@ -1416,7 +1516,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
               </label>
             )}
           </div>
-          <p className="lp-hint">{requirePhotos ? `${photos.length}/3 minimum uploaded` : `${photos.length} added`}</p>
+          <p className="lp-hint">{requirePhotos ? `${photos.length + keptPaths.length}/3 minimum uploaded` : `${photos.length + keptPaths.length} added`}</p>
           {photoError && <p className="lp-error">{photoError}</p>}
         </Section>
 
@@ -1448,7 +1548,7 @@ function WorkerForm({ onBack, onSubmitted, presetName, workerNames, assignedTask
         </label>
 
         {error && <p className="lp-error lp-error--block"><AlertTriangle size={15} /> {error}</p>}
-        <button type="button" className="lp-submit" onClick={handleSubmit} disabled={submitting}>{submitting ? "Submitting…" : "Submit report"}</button>
+        <button type="button" className="lp-submit" onClick={handleSubmit} disabled={submitting}>{submitting ? "Saving…" : editing ? "Save changes" : "Submit report"}</button>
       </div>
     </div>
   );
@@ -1560,12 +1660,14 @@ function ChoiceRow({ options, value, onChange }) {
     </div>
   );
 }
-function SubmittedScreen({ onHome }) {
+function SubmittedScreen({ onHome, edited = false }) {
   return (
     <div className="lp-submitted">
       <div className="lp-submitted-icon"><Check size={30} /></div>
-      <h2>Report submitted</h2>
-      <p>Thanks — today's work has been logged for the property manager.</p>
+      <h2>{edited ? "Changes saved" : "Report submitted"}</h2>
+      <p>{edited
+        ? "Your report has been updated — the manager sees the new version."
+        : "Thanks — today's work has been logged for the property manager."}</p>
       <button className="lp-submit" onClick={onHome}>Done</button>
     </div>
   );
