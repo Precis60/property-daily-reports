@@ -120,6 +120,11 @@ select 'manager-1', 'Manager', 'manager', manager_pin from app_settings
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------
+-- The multi-site model (sites, people, site_assignments, tasks,
+-- task_assignees) now lives in supabase/migrations/001_multi_site_model.sql,
+-- which is documented and safe to re-run. Apply that file first.
+
+-- ---------------------------------------------------------------
 -- Manager schedule: each manager's own day, visible to all managers.
 -- Items another manager adds land as 'pending' until the owner approves.
 create table if not exists manager_schedule (
