@@ -825,17 +825,29 @@ function AppShell() {
   const [people, setPeople] = useState([]);
   const cacheRef = useRef({});
 
+  // Everything here is read under the signed-in user's own permissions, so it
+  // can't be fetched before there's a session and has to be thrown away and
+  // refetched when a different person signs in on the same device.
+  const userId = session?.user?.id || null;
   useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    cacheRef.current = {};
+    setLoading(true);
     (async () => {
       const [idx, at, ppl] = await Promise.all([loadIndex(), loadAssignedTasks(), loadPeople()]);
+      const ym = monthOf(todayISO());
+      const month = await loadMonth(ym);
+      if (cancelled) return;
       setMonthsIndex(idx);
       setAssignedTasks(at);
       setPeople(ppl);
-      const ym = monthOf(todayISO());
-      cacheRef.current[ym] = await loadMonth(ym);
+      cacheRef.current[ym] = month;
+      setCacheVersion((v) => v + 1);
       setLoading(false);
     })();
-  }, []);
+    return () => { cancelled = true; };
+  }, [userId]);
 
   async function getMonths(yms) {
     const missing = yms.filter((ym) => !(ym in cacheRef.current));
@@ -1690,7 +1702,7 @@ function ManagerDashboard({ workers, managers, currentManager, monthsIndex, getM
         <button className={`lp-tab ${tab === "sites" ? "is-active" : ""}`} onClick={() => setTab("sites")}>Admin</button>
         <button className={`lp-tab ${tab === "settings" ? "is-active" : ""}`} onClick={() => setTab("settings")}>Settings</button>
       </div>
-      {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} />}
+      {tab === "brief" && <MorningBrief getMonths={getMonths} refreshMonths={refreshMonths} cacheVersion={cacheVersion} assignedTasks={assignedTasks} />}
       {tab === "tasks" && <TasksPanel currentManager={currentManager} />}
       {tab === "assign" && <AssignTasksPanel workers={workers} assignedTasks={assignedTasks} onAdd={onAddAssignedTask} onRemove={onRemoveAssignedTask} onUpdate={onUpdateAssignedTask} />}
       {tab === "myreport" && (
@@ -2499,7 +2511,63 @@ function matchesSite(report, filter) {
   return report.siteId === filter;
 }
 
-function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
+// The day's job list, drawn from both systems: the live tasks table and the
+// older assigned-tasks list, which still holds jobs nobody has migrated.
+function BriefTasksPanel({ date, assignedTasks }) {
+  const [liveTasks, setLiveTasks] = useState([]);
+  const [people, setPeople] = useState([]);
+  const sites = useSites();
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([loadTasks(date, date), loadAllPeople()]).then(([t, p]) => {
+      if (!cancelled) { setLiveTasks(t); setPeople(p); }
+    });
+    return () => { cancelled = true; };
+  }, [date]);
+
+  const siteName = (id) => sites.find((s) => s.id === id)?.name || id;
+  const personName = (id) => people.find((p) => p.id === id)?.name || "Unknown";
+  const dayAssigned = (assignedTasks || []).filter((t) => t.date === date);
+
+  const rows = [
+    ...liveTasks.map((t) => ({
+      key: `live-${t.id}`,
+      title: t.title,
+      status: taskStatusLabel(t.status),
+      meta: [siteName(t.site_id),
+        t.scheduled_start && t.scheduled_end ? `${fmtTime12(t.scheduled_start)}\u2013${fmtTime12(t.scheduled_end)}` : "",
+        (t.task_assignees || []).length ? t.task_assignees.map((a) => personName(a.person_id)).join(", ") : "Anyone on site",
+      ].filter(Boolean).join(" \u00b7 "),
+    })),
+    ...dayAssigned.map((t) => ({
+      key: `assigned-${t.id}`,
+      title: t.text,
+      status: "Assigned",
+      meta: [expectedWindowLabel(t), assignedToLabel(t.assignedTo)].filter(Boolean).join(" \u00b7 "),
+    })),
+  ];
+
+  return (
+    <div className="lp-panel">
+      <h4><ClipboardList size={15} /> Tasks for this day</h4>
+      {rows.length === 0 ? (
+        <EmptyState compact icon={<Check size={16} />} text="Nothing scheduled for this day." />
+      ) : (
+        <ul className="lp-outstanding">
+          {rows.map((r) => (
+            <li key={r.key}>
+              <span className="lp-out-dot" />
+              <div><strong>{r.title}</strong><p><span className="lp-out-meta">{[r.status, r.meta].filter(Boolean).join(" \u00b7 ")}</span></p></div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function MorningBrief({ getMonths, refreshMonths, cacheVersion, assignedTasks }) {
   const [selectedDate, setSelectedDate] = useState(todayISO());
   const [rangeReports, setRangeReports] = useState([]);
   const [outstandingReports, setOutstandingReports] = useState([]);
@@ -2596,6 +2664,7 @@ function MorningBrief({ getMonths, refreshMonths, cacheVersion }) {
       )}
 
       <div className="lp-brief-grid">
+        <BriefTasksPanel date={selectedDate} assignedTasks={assignedTasks} />
         <div className="lp-panel">
           <h4><AlertTriangle size={15} /> Outstanding jobs</h4>
           <p className="lp-hint lp-panel-sub">From the last {OUTSTANDING_LOOKBACK_DAYS} days</p>
